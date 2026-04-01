@@ -75,7 +75,7 @@ class ParakeetAgent(SpeechToTextAgent):
         print(f"--- Initializing Streaming Parakeet ---")
         self.model = StreamingParakeet(self.cfg)
 
-        super().__init__(args)
+        s (most recent call last): (most recent call last):uper().__init__(args)
 
     @staticmethod
     def add_args(parser):

@@ -56,10 +56,7 @@ class BaseStreamingModel():
 
         self.asr_model, self.model_name = setup_model(cfg, self.device)
         self.asr_model.eval()
-        print('Model Loaded. Sleeping')
-        time.sleep(5)
         self.asr_model.to(self.dtype)
-        print('Model Converted.')
 
         self.sample_rate = self.asr_model._cfg.preprocessor['sample_rate']
         self.feature_stride_sec = self.asr_model._cfg.preprocessor['window_stride']

@@ -1,4 +1,3 @@
-from simuleval import simuleval
 from simuleval.agents import SpeechToTextAgent
 from simuleval.agents.states import AgentStates
 from simuleval.agents.actions import ReadAction, WriteAction

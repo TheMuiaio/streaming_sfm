@@ -75,15 +75,44 @@ class ParakeetStreamingStates(AgentStates):
         self.current_offset += (stride // self.encoder_frame2audio_samples)
         super().update_source(segment)
 
+import logging
+logger = logging.getLogger(__name__)
+try:
+    from segfreetk import LOG_LEVEL
+    logger.setLevel(LOG_LEVEL)
+except:
+    logger.info("Segfreetk not installed.")
+
+from types import SimpleNamespace
+
 @entrypoint
 class ParakeetAgent(SpeechToTextAgent):
-    def __init__(self, args: Namespace):
-        self.cfg = OmegaConf.create(vars(args))
-        with open_dict(self.cfg):
-            self.cfg.cuda = 0 if args.device == "cuda" else -1
-            self.cfg.allow_mps = True if args.device == "mps" else False
+    def __init__(self, 
+        args: SimpleNamespace):
+        cfg_args = Namespace(
+            model_path=getattr(args, "sfm_model_path", None),
+            pretrained_name=getattr(args, "sfm_pretrained_name", "nvidia/parakeet-tdt-0.6b-v3"),
+            manifest_path=getattr(args, "sfm_manifest_path", "vp.jsonl"),
 
-        model_id = args.model_path or args.pretrained_name
+            chunk_secs=getattr(args, "sfm_chunk_secs", 1),
+            left_context_secs=getattr(args, "sfm_left_context_secs", 20),
+            right_context_secs=getattr(args, "sfm_right_context_secs", 0),
+
+            policy=getattr(args, "sfm_policy", "LACP"),
+            lacp_threshold=getattr(args, "sfm_lacp_threshold", 2),
+            K=getattr(args, "sfm_K", 2),
+            N=getattr(args, "sfm_N", 5),
+
+            device=getattr(args, "sfm_device", "cuda"),
+            compute_dtype=getattr(args, "sfm_compute_dtype", "float16"),
+        )
+        self.cfg = OmegaConf.create(vars(cfg_args))
+        with open_dict(self.cfg):
+            self.cfg.cuda = 0 if cfg_args.device == "cuda" else -1
+            self.cfg.allow_mps = True if cfg_args.device == "mps" else False
+
+        model_id = cfg_args.pretrained_name
+        self.cfg.model_path = None
         print("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAa")
         if not model_id:
             raise ValueError("Neither of --model_path or --pretrained_name were provided")
@@ -93,24 +122,24 @@ class ParakeetAgent(SpeechToTextAgent):
 
     @staticmethod
     def add_args(parser):
-        parser.add_argument("--model_path", type=str, default=None, help="Path to .nemo file")
-        parser.add_argument("--pretrained_name", type=str, default=None, help="Name of a pretrained model")
-        parser.add_argument("--manifest_path", type=str, default="vp.jsonl", help="Path to NeMo manifest")
+        #parser.add_argument("--model_path", type=str, default=None, help="Path to .nemo file")
+        parser.add_argument("--sfm_pretrained_name", type=str, default="nvidia/parakeet-tdt-0.6b-v3", help="Name of a pretrained model")
+        parser.add_argument("--sfm_manifest_path", type=str, default="vp.jsonl", help="Path to NeMo manifest")
     
         # Streaming / Windowing
-        parser.add_argument("--chunk_secs", type=float, default=1, help="Duration of the sliding window chunk")
-        parser.add_argument("--left_context_secs", type=float, default=20, help="Left context duration")
-        parser.add_argument("--right_context_secs", type=float, default=0, help="Right context duration")
+        parser.add_argument("--sfm_chunk_secs", type=float, default=1, help="Duration of the sliding window chunk")
+        parser.add_argument("--sfm_left_context_secs", type=float, default=20, help="Left context duration")
+        parser.add_argument("--sfm_right_context_secs", type=float, default=0, help="Right context duration")
     
         # Emission Policies
-        parser.add_argument("--policy", type=str, default="LACP", choices=["LCP", "LACP", "WaitK", "HoldN"])
-        parser.add_argument("--lacp_threshold", type=float, default=2, help="Threshold for LACP policy")
-        parser.add_argument("--K", type=int, default=2, help="K value for WaitK policy")
-        parser.add_argument("--N", type=int, default=5, help="N value for HoldN policy")
+        parser.add_argument("--sfm_policy", type=str, default="LACP", choices=["LCP", "LACP", "WaitK", "HoldN"])
+        parser.add_argument("--sfm_lacp_threshold", type=float, default=2, help="Threshold for LACP policy")
+        parser.add_argument("--sfm_K", type=int, default=2, help="K value for WaitK policy")
+        parser.add_argument("--sfm_N", type=int, default=5, help="N value for HoldN policy")
     
         # Hardware
-        parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
-        parser.add_argument("--compute_dtype", type=str, default="float16", choices=["float16", "float32", "bfloat16"])
+        parser.add_argument("--sfm_device", type=str, default="cuda", help="cuda or cpu")
+        parser.add_argument("--sfm_compute_dtype", type=str, default="bfloat16", choices=["float16", "float32", "bfloat16"])
 
     def build_states(self) -> ParakeetStreamingStates:
         audio_buffer = StreamingBatchedAudioBufferWithOffset(
@@ -148,9 +177,10 @@ class ParakeetAgent(SpeechToTextAgent):
     
     @torch.no_grad()
     def policy(self, states: Optional[AgentStates] = None):
+        
         if not states.buffer.samples.shape[1]:
             return ReadAction()
-        
+
         hyp = self.model.process_chunk(states.buffer, states.current_offset)
 
         hyp_buffer = states.hyp_buffer.insert(hyp)
@@ -171,4 +201,5 @@ class ParakeetAgent(SpeechToTextAgent):
         #out_text = ' '.join([t for _, _, t in out])
         out_toks = [t for _, _, t in out]
         out_text = self.model.asr_model.tokenizer.tokens_to_text(out_toks)
+        logger.debug(f"ASR OUT {out_text}")
         return WriteAction(out_text, finished=states.source_finished)

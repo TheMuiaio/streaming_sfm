@@ -91,6 +91,19 @@ from types import SimpleNamespace
 class ParakeetAgent(SpeechToTextAgent):
     def __init__(self, 
         args: SimpleNamespace):
+
+        boosting_alpha = getattr(args, "sfm_boosting_tree_alpha", 0.7)
+        beam_size = getattr(args, "sfm_decode", "greedy_batch")
+        boosting_cfg = {
+            "context_score":getattr(args, "sfm_context_score", 1.0 ),
+            "depth_scaling":getattr(args, "sfm_depth_scaling", 2.0 ),
+            "key_phrases_file": None
+        }
+        decoding_cfg = {
+                "strategy": "greedy_batch" if beam_size == 1 else "malsd_batch" ,
+                "greedy" : {"boosting_tree": boosting_cfg, "boosting_tree_alpha":boosting_alpha},
+                "beam" : {"boosting_tree": boosting_cfg , "boosting_tree_alpha":boosting_alpha, "beam_size": beam_size},
+        }
         cfg_args = Namespace(
             model_path=getattr(args, "sfm_model_path", None),
             pretrained_name=getattr(args, "sfm_pretrained_name", "nvidia/parakeet-tdt-0.6b-v3"),
@@ -108,6 +121,8 @@ class ParakeetAgent(SpeechToTextAgent):
             device=getattr(args, "sfm_device", "cuda"),
             compute_dtype=getattr(args, "sfm_compute_dtype", "float16"),
             emit_incomplete=getattr(args, "sfm_emit_incomplete", False),
+            rnnt_decoding=decoding_cfg
+
         )
         self.cfg = OmegaConf.create(vars(cfg_args))
         with open_dict(self.cfg):
@@ -144,6 +159,12 @@ class ParakeetAgent(SpeechToTextAgent):
         # Hardware
         parser.add_argument("--sfm_device", type=str, default="cuda", help="cuda or cpu")
         parser.add_argument("--sfm_compute_dtype", type=str, default="bfloat16", choices=["float16", "float32", "bfloat16"])
+        parser.add_argument("--sfm_decode", type=int, default=1) #1 -> greedy >1 beam
+        
+        parser.add_argument("--sfm_context_score", type=float, default=1.0)
+        parser.add_argument("--sfm_depth_scaling", type=float, default=2.0)
+        parser.add_argument("--sfm_boosting_tree_alpha", type=float, default=0.7)
+
 
     def build_states(self) -> ParakeetStreamingStates:
         audio_buffer = StreamingBatchedAudioBufferWithOffset(

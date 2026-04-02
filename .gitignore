@@ -1,0 +1,5 @@
+build/*
+*egg*/*
+src/streaming_sfm.egg-info/
+*egg-info/*
+*.pyc

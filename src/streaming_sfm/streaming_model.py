@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from abc import ABC, abstractmethod
 from typing import List, Tuple, Optional
-from omegaconf import open_dict
+from omegaconf import open_dict, OmegaConf
 from nemo.collections.asr.parts.utils.streaming_utils import ContextSize, StreamingBatchedAudioBuffer
 from nemo.collections.asr.parts.utils.transcribe_utils import setup_model, get_inference_device, get_inference_dtype
 
@@ -13,6 +13,15 @@ from .hyp_utils import LCPHypothesisBuffer, LACPHypothesisBuffer, WaitKHypothesi
 
 from nemo.collections.asr.parts.utils.rnnt_utils import batched_hyps_to_hypotheses
 from .utils import _transcribe_output_processing2
+
+
+import logging
+logger = logging.getLogger(__name__)
+try:
+    from segfreetk import LOG_LEVEL
+    logger.setLevel(LOG_LEVEL)
+except:
+    logger.info("Segfreetk not installed.")
 
 
 class StreamingBatchedAudioBufferWithOffset(StreamingBatchedAudioBuffer):
@@ -147,9 +156,14 @@ class StreamingParakeet(BaseStreamingModel):
 
         with open_dict(self.asr_model.cfg.decoding):
             self.asr_model.cfg.decoding.greedy.preserve_alignments = True
+            self.asr_model.cfg.decoding.beam.preserve_alignments = True
             self.asr_model.cfg.decoding.tdt_include_token_duration = True
         
-        self.asr_model.change_decoding_strategy(self.asr_model.cfg.decoding)
+        with open_dict(self.asr_model.cfg.decoding):
+            cfg = OmegaConf.merge(self.asr_model.cfg.decoding, cfg.rnnt_decoding)
+        
+        self.asr_model.change_decoding_strategy(OmegaConf.create(cfg))
+        #self.asr_model.change_decoding_strategy(self.asr_model.cfg.decoding)
 
     def process_chunk(self, buffer, current_offset):
         # Forward pass through encoder
@@ -159,12 +173,20 @@ class StreamingParakeet(BaseStreamingModel):
         )
         encoder_output = encoder_output.transpose(1, 2)
 
-        chunk_batched_hyps, _, _ = self.asr_model.decoding.decoding.decoding_computer(
-            x=encoder_output, out_len=encoder_output_len, prev_batched_state=None
-        )
+        if self.asr_model.cfg.decoding.strategy == "greedy_batch":
+            chunk_batched_hyps, _, _ = self.asr_model.decoding.decoding.decoding_computer(
+                x=encoder_output, out_len=encoder_output_len, prev_batched_state=None
+            )
+            unbatched_hyp = batched_hyps_to_hypotheses(chunk_batched_hyps)[0]
+            timestamped_hyp = self.asr_model.decoding.compute_rnnt_timestamps(unbatched_hyp)
+        elif self.asr_model.cfg.decoding.strategy == "malsd_batch":
+            #need this pull request: pip install "nemo_toolkit[all] @ git+https://github.com/NVIDIA/NeMo.git@refs/pull/15411/head"
+            chunk_batched_hyps = self.asr_model.decoding.decoding._decoding_computer(
+                x=encoder_output, out_len=encoder_output_len
+            )
+            unbatched_hyp = chunk_batched_hyps.to_hyps_list()[0]
+            timestamped_hyp = self.asr_model.decoding.compute_rnnt_timestamps(unbatched_hyp)
 
-        unbatched_hyp = batched_hyps_to_hypotheses(chunk_batched_hyps)[0]
-        timestamped_hyp = self.asr_model.decoding.compute_rnnt_timestamps(unbatched_hyp)
         toks = self.asr_model.decoding.decode_ids_to_tokens(timestamped_hyp.y_sequence.tolist())
 
         return [(t['start_offset'] + current_offset, t['end_offset'] + current_offset, tok)

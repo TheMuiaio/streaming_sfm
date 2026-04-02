@@ -73,6 +73,7 @@ class BaseStreamingModel():
             chunk=int(cfg.chunk_secs * self.features_per_sec / self.subsampling_factor),
             right=int(cfg.right_context_secs * self.features_per_sec / self.subsampling_factor),
         )
+        print(f'CONTEXT SIZE = left: {encoder_frames.left*self.encoder_frame2audio_samples/self.sample_rate} chunk: {encoder_frames.chunk*self.encoder_frame2audio_samples/self.sample_rate} right: {encoder_frames.right*self.encoder_frame2audio_samples/self.sample_rate}')
         return ContextSize(
             left=encoder_frames.left * self.encoder_frame2audio_samples,
             chunk=encoder_frames.chunk * self.encoder_frame2audio_samples,

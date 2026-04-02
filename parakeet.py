@@ -31,7 +31,7 @@ class ParakeetStreamingStates(AgentStates):
     dtype: torch.dtype
     device: torch.device
 
-    def reset(self, asr_model): # TODO
+    def reset(self, cfg, asr_model): 
         super().reset()
 
         self.buffer = StreamingBatchedAudioBufferWithOffset(
@@ -41,20 +41,35 @@ class ParakeetStreamingStates(AgentStates):
             device = asr_model.device,
         )
 
-        self.hyp_buffer.reset() 
+        self.hyp_buffer = self.reset_hyp_buffer(cfg, asr_model)
         self.current_offset = 0
         self.encoder_frame2audio_samples = asr_model.encoder_frame2audio_samples
         self.left_sample = 0
-        self.right_sample = asr_model.context_samples.chunk + asr_model.context.samples.right
+        self.right_sample = asr_model.context_samples.chunk + asr_model.context_samples.right
         self.dtype = asr_model.dtype
         self.device = asr_model.device
 
+    def reset_hyp_buffer(self, cfg, model):
+        if cfg.policy == 'LCP':
+            hyp_buffer = LCPHypothesisBuffer()
+        elif cfg.policy == 'LACP':
+            hyp_buffer = LACPHypothesisBuffer(cfg.lacp_threshold)
+        elif cfg.policy == 'WaitK':
+            hyp_buffer = WaitKHypothesisBuffer(
+                cfg.K,
+                features_per_second=model.features_per_sec,
+                subsampling_factor=model.subsampling_factor,
+            )
+        else:
+            hyp_buffer = HoldNHypothesisBuffer(cfg.N)
+        return hyp_buffer
+
     def update_source(self, segment):
         stride = self.buffer.add_audio_batch_get_stride(
-            segment.content,
-            audio_lengths=torch.tensor([len(segment)], device = self.device),
-            is_last_chunk=segment.source_finished,
-            is_last_chunk_batch=torch.tensor([segment.source_finished], device = self.device),
+            torch.tensor([segment.content], device = self.device),
+            audio_lengths=torch.tensor([len(segment.content)], device = self.device),
+            is_last_chunk=segment.finished,
+            is_last_chunk_batch=torch.tensor([segment.finished], device = self.device),
             )
 
         self.current_offset += (stride // self.encoder_frame2audio_samples)
@@ -74,8 +89,7 @@ class ParakeetAgent(SpeechToTextAgent):
             raise ValueError("Neither of --model_path or --pretrained_name were provided")
         print(f"--- Initializing Streaming Parakeet ---")
         self.model = StreamingParakeet(self.cfg)
-
-        s (most recent call last): (most recent call last):uper().__init__(args)
+        super().__init__(args)
 
     @staticmethod
     def add_args(parser):
@@ -130,7 +144,7 @@ class ParakeetAgent(SpeechToTextAgent):
         )
 
     def reset(self):
-        super().reset(self.model)
+        self.states.reset(self.cfg, self.model)
     
     def policy(self, states: Optional[AgentStates] = None):
         if not states.buffer.samples.shape[1]:

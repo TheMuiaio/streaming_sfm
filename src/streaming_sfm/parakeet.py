@@ -28,6 +28,7 @@ class ParakeetStreamingStates(AgentStates):
     encoder_frame2audio_samples: int
     left_sample: int
     right_sample: int
+    incomplete_buffer: list
     dtype: torch.dtype
     device: torch.device
 
@@ -46,6 +47,7 @@ class ParakeetStreamingStates(AgentStates):
         self.encoder_frame2audio_samples = asr_model.encoder_frame2audio_samples
         self.left_sample = 0
         self.right_sample = asr_model.context_samples.chunk + asr_model.context_samples.right
+        self.incomplete_buffer = []
         self.dtype = asr_model.dtype
         self.device = asr_model.device
 
@@ -107,6 +109,9 @@ class ParakeetAgent(SpeechToTextAgent):
         parser.add_argument("--lacp_threshold", type=float, default=2, help="Threshold for LACP policy")
         parser.add_argument("--K", type=int, default=2, help="K value for WaitK policy")
         parser.add_argument("--N", type=int, default=5, help="N value for HoldN policy")
+
+        # Speculative strategy
+        parser.add_argument("--emit_incomplete", type=bool, default=False, help="Whether or not to emit incomplete words at the end of the segment")
     
         # Hardware
         parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
@@ -139,6 +144,7 @@ class ParakeetAgent(SpeechToTextAgent):
             encoder_frame2audio_samples=self.model.encoder_frame2audio_samples,
             left_sample=0,
             right_sample=self.model.context_samples.chunk + self.model.context_samples.right,
+            incomplete_buffer=[],
             dtype=self.model.dtype,
             device=self.model.device,
         )
@@ -168,7 +174,24 @@ class ParakeetAgent(SpeechToTextAgent):
             return ReadAction()
         
         ## Gestionar paraules incompletes !!!!!!!!!
-        #out_text = ' '.join([t for _, _, t in out])
         out_toks = [t for _, _, t in out]
+
+        if not self.cfg.emit_incomplete:
+            # Check incomplete buffer. Add it as a prefix
+            if len(states.incomplete_buffer):
+                out_toks[:0] = states.incomplete_buffer
+                states.incomplete_buffer = []
+            # Remove possible incomplete words
+            if not states.source_finished:
+                # Get last '▁' token
+                last_word = -1
+                for i in range(len(out_toks)-1, -1, -1):
+                    if out_toks[i].startswith('▁'):
+                        last_word = i
+                        break
+                if last_word != -1:
+                    states.incomplete_buffer = out_toks[last_word:]
+                    out_toks = out_toks[:last_word]
+
         out_text = self.model.asr_model.tokenizer.tokens_to_text(out_toks)
         return WriteAction(out_text, finished=states.source_finished)

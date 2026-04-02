@@ -28,7 +28,7 @@ class ABSHypothesisBuffer:
 
 
 class LCPHypothesisBuffer(ABSHypothesisBuffer):
-    def __init__(self, uncased=True, debug=False):
+    def __init__(self, uncased=True, debug=True):
         super(LCPHypothesisBuffer, self).__init__(debug=debug)
         self.commited_in_buffer = [] # Paraules del buffer que ja s'han consolidat
         self.new = [] # Buffer de paraules noves a afegir al buffer
@@ -107,6 +107,14 @@ class LCPHypothesisBuffer(ABSHypothesisBuffer):
 
         self.buffer = self.new
         self.new = []
+
+        if len(self.commited_in_buffer) and self.commited_in_buffer[-1][2] in punct:
+            if len(commit) and commit[0][2] in punct:
+                commit = commit[1:]
+
+        if len(commit) < 1:
+            return commit
+
         self.commited_in_buffer.extend(commit)
         if self.debug:
             print(f'[LCPHypothesisBuffer -> flush] Committing {commit}')
@@ -158,7 +166,7 @@ class LCPHypothesisBuffer(ABSHypothesisBuffer):
 
 
 class LACPHypothesisBuffer(ABSHypothesisBuffer):
-    def __init__(self, threshold: int = 2, uncased=True, debug=False):
+    def __init__(self, threshold: int = 2, uncased=True, debug=True):
         super(LACPHypothesisBuffer, self).__init__(debug=debug)
         self.commited_in_buffer = [] # Paraules del buffer que ja s'han consolidat
         self.new = [] # Buffer de paraules noves a afegir al buffer
@@ -215,6 +223,7 @@ class LACPHypothesisBuffer(ABSHypothesisBuffer):
         if self.debug:
             print(f'[LCPHypothesisBuffer -> flush] Buffer n-1 is {self.buffer}')
             print(f'[LCPHypothesisBuffer -> flush] Buffer n is {self.new}')
+        punct = [',', '.', '!', '?']
         commit = []
         past = []
         present = []
@@ -235,11 +244,16 @@ class LACPHypothesisBuffer(ABSHypothesisBuffer):
         self.buffer = self.new[i:]
         self.new = []
 
+        if len(self.commited_in_buffer) and self.commited_in_buffer[-1][2] in punct:
+            if len(commit) and commit[0][2] in punct:
+                commit = commit[1:]
+
         if len(commit) < 1:
             return commit
 
         self.last_commited_word = commit[-1][2]
         self.last_commited_time = commit[-1][1]
+
         self.commited_in_buffer.extend(commit)
 
         if self.debug:

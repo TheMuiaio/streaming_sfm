@@ -32,7 +32,7 @@ class ParakeetStreamingStates(AgentStates):
     dtype: torch.dtype
     device: torch.device
 
-    def reset(self, cfg, asr_model): 
+    def reset(self, cfg, asr_model):
         super().reset()
 
         self.buffer = StreamingBatchedAudioBufferWithOffset(
@@ -50,6 +50,7 @@ class ParakeetStreamingStates(AgentStates):
         self.incomplete_buffer = []
         self.dtype = asr_model.dtype
         self.device = asr_model.device
+        self.speech_id = 0
 
     def reset_hyp_buffer(self, cfg, model):
         if cfg.policy == 'LCP':
@@ -89,11 +90,11 @@ from types import SimpleNamespace
 
 @entrypoint
 class ParakeetAgent(SpeechToTextAgent):
-    def __init__(self, 
+    def __init__(self,
         args: SimpleNamespace):
 
         boosting_alpha = getattr(args, "sfm_boosting_tree_alpha", 0.7)
-        beam_size = getattr(args, "sfm_decode", "greedy_batch")
+        beam_size = getattr(args, "sfm_decode", 1)
         boosting_cfg = {
             "context_score":getattr(args, "sfm_context_score", 1.0 ),
             "depth_scaling":getattr(args, "sfm_depth_scaling", 2.0 ),
@@ -135,6 +136,16 @@ class ParakeetAgent(SpeechToTextAgent):
         if not model_id:
             raise ValueError("Neither of --model_path or --pretrained_name were provided")
         print(f"--- Initializing Streaming Parakeet ---")
+
+        #if getattr(args, "pdfs", False):
+        #    with tempfile.NamedTemporaryFile(mode="w+", delete=True, suffix=".txt") as word_boost_tmp:
+        #        #word_boost_list = "Markko Turchi"
+        #        #word_boost_tmp.write(word_boost_list)
+        #        #word_boost_tmp.flush()
+        #        #self.cfg.rnnt_decoding.greedy.boosting_tree.key_phrases_file = word_boost_tmp.name
+        #        #self.cfg.rnnt_decoding.beam.boosting_tree.key_phrases_file = word_boost_tmp.name
+        #        self.model = StreamingParakeet(self.cfg)
+        #else:
         self.model = StreamingParakeet(self.cfg)
         super().__init__(args)
 
@@ -143,27 +154,28 @@ class ParakeetAgent(SpeechToTextAgent):
         #parser.add_argument("--model_path", type=str, default=None, help="Path to .nemo file")
         parser.add_argument("--sfm_pretrained_name", type=str, default="nvidia/parakeet-tdt-0.6b-v3", help="Name of a pretrained model")
         parser.add_argument("--sfm_manifest_path", type=str, default="vp.jsonl", help="Path to NeMo manifest")
-    
+
         # Streaming / Windowing
         parser.add_argument("--sfm_chunk_secs", type=float, default=1, help="Duration of the sliding window chunk")
         parser.add_argument("--sfm_left_context_secs", type=float, default=20, help="Left context duration")
         parser.add_argument("--sfm_right_context_secs", type=float, default=0, help="Right context duration")
-    
+
         # Emission Policies
         parser.add_argument("--sfm_policy", type=str, default="LACP", choices=["LCP", "LACP", "WaitK", "HoldN"])
         parser.add_argument("--sfm_lacp_threshold", type=float, default=2, help="Threshold for LACP policy")
         parser.add_argument("--sfm_K", type=int, default=2, help="K value for WaitK policy")
         parser.add_argument("--sfm_N", type=int, default=5, help="N value for HoldN policy")
         parser.add_argument("--sfm_emit_incomplete", type=bool, default=False, help="Whether or not to emit incomplete words at the end of the segment")
-    
+
         # Hardware
         parser.add_argument("--sfm_device", type=str, default="cuda", help="cuda or cpu")
         parser.add_argument("--sfm_compute_dtype", type=str, default="bfloat16", choices=["float16", "float32", "bfloat16"])
         parser.add_argument("--sfm_decode", type=int, default=1) #1 -> greedy >1 beam
-        
+
         parser.add_argument("--sfm_context_score", type=float, default=1.0)
         parser.add_argument("--sfm_depth_scaling", type=float, default=2.0)
         parser.add_argument("--sfm_boosting_tree_alpha", type=float, default=0.7)
+        parser.add_argument("--pdfs", action="store_true")
 
 
     def build_states(self) -> ParakeetStreamingStates:
@@ -200,10 +212,10 @@ class ParakeetAgent(SpeechToTextAgent):
 
     def reset(self):
         self.states.reset(self.cfg, self.model)
-    
+
     @torch.no_grad()
     def policy(self, states: Optional[AgentStates] = None):
-        
+
         if not states.buffer.samples.shape[1]:
             return ReadAction()
 
@@ -215,14 +227,14 @@ class ParakeetAgent(SpeechToTextAgent):
             out = states.hyp_buffer.flush(last_instant=states.left_sample // states.encoder_frame2audio_samples)
         else:
             out = states.hyp_buffer.flush()
-        
+
         if states.source_finished:
             out.extend(states.hyp_buffer.complete())
 
         if not out:
             # Empty token buffer. Return ReadAction
             return ReadAction()
-        
+
         ## Gestionar paraules incompletes !!!!!!!!!
         out_toks = [t for _, _, t in out]
 

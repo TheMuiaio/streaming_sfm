@@ -99,10 +99,17 @@ from types import SimpleNamespace
 @entrypoint
 class ParakeetAgent(SpeechToTextAgent):
     def __init__(self,
-        args: SimpleNamespace):
+        args: SimpleNamespace,
+        ):
 
-        boosting_alpha = getattr(args, "sfm_boosting_tree_alpha", 0.7)
+        for key, value in vars(args).items():
+            setattr(self, key, value)
+
+        logger.debug(args)
+        logger.debug(args.__dict__.keys())
+        boosting_alpha = getattr(args, "sfm_boosting_tree_alpha", 1.0)
         beam_size = getattr(args, "sfm_decode", 1)
+        logger.debug(f"Beam size will be {beam_size}")
         boosting_cfg = {
             "context_score":getattr(args, "sfm_context_score", 1.0 ),
             "depth_scaling":getattr(args, "sfm_depth_scaling", 2.0 ),
@@ -128,7 +135,7 @@ class ParakeetAgent(SpeechToTextAgent):
             N=getattr(args, "sfm_N", 5),
 
             device=getattr(args, "sfm_device", "cuda"),
-            compute_dtype=getattr(args, "sfm_compute_dtype", "float16"),
+            compute_dtype=getattr(args, "sfm_compute_dtype", "bfloat16"),
             emit_incomplete=getattr(args, "sfm_emit_incomplete", False),
             rnnt_decoding=decoding_cfg
 
@@ -145,17 +152,18 @@ class ParakeetAgent(SpeechToTextAgent):
             raise ValueError("Neither of --model_path or --pretrained_name were provided")
         print(f"--- Initializing Streaming Parakeet ---")
 
-        #if getattr(args, "pdfs", False):
-        #    with tempfile.NamedTemporaryFile(mode="w+", delete=True, suffix=".txt") as word_boost_tmp:
-        #        #word_boost_list = "Markko Turchi"
-        #        #word_boost_tmp.write(word_boost_list)
-        #        #word_boost_tmp.flush()
-        #        #self.cfg.rnnt_decoding.greedy.boosting_tree.key_phrases_file = word_boost_tmp.name
-        #        #self.cfg.rnnt_decoding.beam.boosting_tree.key_phrases_file = word_boost_tmp.name
-        #        self.model = StreamingParakeet(self.cfg)
-        #else:
-        print(self.cfg)
-        self.model = StreamingParakeet(self.cfg)
+
+        import tempfile
+        if getattr(args, "pdfs", False):
+            with tempfile.NamedTemporaryFile(mode="w+", delete=True, suffix=".txt") as word_boost_tmp:
+                word_boost_list = "Markko Turchi\nSara Pape"
+                word_boost_tmp.write(word_boost_list)
+                word_boost_tmp.flush()
+                self.cfg.rnnt_decoding.greedy.boosting_tree.key_phrases_file = word_boost_tmp.name
+                self.cfg.rnnt_decoding.beam.boosting_tree.key_phrases_file = word_boost_tmp.name
+                self.model = StreamingParakeet(self.cfg)
+        else:
+            self.model = StreamingParakeet(self.cfg, mbr=getattr(args, "sfm_mbr", False))
         super().__init__(args)
 
     @staticmethod
@@ -184,6 +192,7 @@ class ParakeetAgent(SpeechToTextAgent):
         parser.add_argument("--sfm_context_score", type=float, default=1.0)
         parser.add_argument("--sfm_depth_scaling", type=float, default=2.0)
         parser.add_argument("--sfm_boosting_tree_alpha", type=float, default=0.7)
+        parser.add_argument("--sfm_mbr", action="store_true")
         parser.add_argument("--pdfs", action="store_true")
 
 
@@ -268,5 +277,5 @@ class ParakeetAgent(SpeechToTextAgent):
                     out_toks = out_toks[:last_word]
 
         out_text = self.model.asr_model.tokenizer.tokens_to_text(out_toks)
-        logger.debug(f"ASR OUT {out_text}")
+        logger.info(f"ASR OUT {out_text}")
         return WriteAction(out_text, finished=states.source_finished)

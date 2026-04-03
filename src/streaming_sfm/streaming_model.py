@@ -56,7 +56,7 @@ class StreamingBatchedAudioBufferWithOffset(StreamingBatchedAudioBuffer):
         return extra_samples_in_buffer
 
 class BaseStreamingModel():
-    def __init__(self, cfg):
+    def __init__(self, cfg, mbr):
         self.cfg = cfg
         self.device = get_inference_device(cuda=cfg.cuda, allow_mps=cfg.allow_mps)
         self.dtype = get_inference_dtype(cfg.compute_dtype, device=self.device)
@@ -72,6 +72,26 @@ class BaseStreamingModel():
         self.encoder_frame2audio_samples = int(self.sample_rate * self.feature_stride_sec) * self.subsampling_factor
 
         self.context_samples = self._compute_context(cfg)
+
+        try:
+            if mbr:
+                from streaming_sfm import mbr
+                from mbrs.decoders import get_decoder
+                from mbrs.metrics import get_metric
+
+                decoder_class = get_decoder("mbr")
+                metric_class = get_metric("fastwer")
+                metric_cfg = metric_class.Config()
+                metric = metric_class(metric_cfg)
+                decoder_cfg = decoder_class.Config()
+                self.mbr = decoder_class(decoder_cfg, metric)
+                logger.debug("MBR: Active")
+            else:
+                logger.debug("MBR: Deactivated")
+                self.mbr = None
+        except:
+            logger.warning("MBR: Deactivated (could not import)")
+            self.mbr = None
 
     def _compute_context(self, cfg):
         """Returns the context size in samples for left, right and current chunk contexts"""
@@ -149,8 +169,8 @@ class BaseStreamingModel():
         return " ".join([t for _, _, t in committed_results])
 
 class StreamingParakeet(BaseStreamingModel):
-    def __init__(self, cfg):
-        super().__init__(cfg)
+    def __init__(self, cfg, mbr=False):
+        super().__init__(cfg, mbr)
 
         with open_dict(self.asr_model.cfg.decoding):
             self.asr_model.cfg.decoding.greedy.preserve_alignments = True
@@ -171,21 +191,49 @@ class StreamingParakeet(BaseStreamingModel):
         )
         encoder_output = encoder_output.transpose(1, 2)
 
+        logger.debug(self.asr_model.cfg.decoding.strategy)
         if self.asr_model.cfg.decoding.strategy == "greedy_batch":
+            logger.error("Decoding strategy: greedy_batch")
             chunk_batched_hyps, _, _ = self.asr_model.decoding.decoding.decoding_computer(
                 x=encoder_output, out_len=encoder_output_len, prev_batched_state=None
             )
             unbatched_hyp = batched_hyps_to_hypotheses(chunk_batched_hyps)[0]
             timestamped_hyp = self.asr_model.decoding.compute_rnnt_timestamps(unbatched_hyp)
+            toks = self.asr_model.decoding.decode_ids_to_tokens(timestamped_hyp.y_sequence.tolist())
         elif self.asr_model.cfg.decoding.strategy == "malsd_batch":
             #need this pull request: pip install "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@refs/pull/15411/head"
             chunk_batched_hyps = self.asr_model.decoding.decoding._decoding_computer(
                 x=encoder_output, out_len=encoder_output_len
             )
-            unbatched_hyp = chunk_batched_hyps.to_hyps_list()[0]
-            timestamped_hyp = self.asr_model.decoding.compute_rnnt_timestamps(unbatched_hyp)
-
-        toks = self.asr_model.decoding.decode_ids_to_tokens(timestamped_hyp.y_sequence.tolist())
+            logger.debug(chunk_batched_hyps)
+            logger.debug(f"Decoding strategy: masld_batch {self.mbr}=")
+            if self.mbr:
+                hyps = []
+                hyps_toks = []
+                timestamp_hyps = []
+                logger.debug("ALKALOIDE")
+                logger.debug(len(chunk_batched_hyps.to_nbest_hyps_list()))
+                logger.debug(len(chunk_batched_hyps.to_nbest_hyps_list()[0].n_best_hypotheses))
+                for hyp in chunk_batched_hyps.to_nbest_hyps_list()[0].n_best_hypotheses:
+                    unbatched_hyp = hyp
+                    timestamped_hyp = self.asr_model.decoding.compute_rnnt_timestamps(unbatched_hyp)
+                    toks = self.asr_model.decoding.decode_ids_to_tokens(timestamped_hyp.y_sequence.tolist())
+                    text = self.asr_model.tokenizer.tokens_to_text(toks)
+                    hyps.append(text)
+                    timestamp_hyps.append(timestamped_hyp)
+                    hyps_toks.append(toks)
+                refs = hyps
+                logger.debug(hyps)
+                mbrs_rescored = self.mbr.decode(hyps, refs, nbest=1)
+                logger.debug(mbrs_rescored)
+                mbr_best_idx = mbrs_rescored.idx[0]
+                timestamped_hyp = timestamp_hyps[mbr_best_idx]
+                toks = hyps_toks[mbr_best_idx]
+            else:
+                unbatched_hyp = chunk_batched_hyps.to_hyps_list()[0]
+                timestamped_hyp = self.asr_model.decoding.compute_rnnt_timestamps(unbatched_hyp)
+                toks = self.asr_model.decoding.decode_ids_to_tokens(timestamped_hyp.y_sequence.tolist())
+                logger.debug(self.asr_model.tokenizer.tokens_to_text(toks))
 
         return [(t['start_offset'] + current_offset, t['end_offset'] + current_offset, tok)
                 for t, tok in zip(timestamped_hyp.timestamp['char'], toks)]

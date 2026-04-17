@@ -338,10 +338,10 @@ class LACPHypothesisBuffer(ABSHypothesisBuffer):
                                 )
                             break
 
-    def flush(self):
-        return self.flush_uncased() if self.uncased else self.flush_cased()
+    def flush(self, forced=False):
+        return self.flush_uncased(forced=forced) if self.uncased else self.flush_cased(forced=forced)
 
-    def flush_uncased(self):
+    def flush_uncased(self, forced):
         if self.debug:
             logger.debug(f'[LACPHypothesisBuffer -> flush] Buffer n-1: {self.buffer}')
             logger.debug(f'[LACPHypothesisBuffer -> flush] Buffer n  : {self.new}')
@@ -349,6 +349,10 @@ class LACPHypothesisBuffer(ABSHypothesisBuffer):
         commit = []
         past = []
         present = []
+
+        # if forced, returning commit early maintains the n-1 buffer for the next iteration
+        if forced and not self.new:
+            return commit
 
         # BUG FIX #4: use a proper for-loop. `while i in range(...)` works
         # but recomputes membership each iteration and is semantically misleading.
@@ -383,7 +387,7 @@ class LACPHypothesisBuffer(ABSHypothesisBuffer):
             logger.debug(f'[LACPHypothesisBuffer -> flush] Committing {commit}')
         return commit
 
-    def flush_cased(self):
+    def flush_cased(self, forced):
         """
         BUG FIX #5: The original flush_cased was an exact-match copy of
         LCPHypothesisBuffer.flush_cased, completely ignoring the Levenshtein

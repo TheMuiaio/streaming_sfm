@@ -373,6 +373,8 @@ class ParakeetAgent(SpeechToTextAgent):
             out = states.hyp_buffer.flush(
                 last_instant=states.left_sample // states.encoder_frame2audio_samples
             )
+        elif self.cfg.policy == 'LACP':
+            out = states.hyp_buffer.flush(forced=True)
         elif self.cfg.policy == 'LCP' and states.nchunks_no_output >= max_empty_chunks:
             out = states.hyp_buffer.flush(forced=True)
         else:

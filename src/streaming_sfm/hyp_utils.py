@@ -163,13 +163,22 @@ class LCPHypothesisBuffer(ABSHypothesisBuffer):
                                 )
                             break
 
-    def flush(self):
-        return self.flush_uncased() if self.uncased else self.flush_cased()
+    def flush(self, forced=False):
+        return self.flush_uncased(forced=forced) if self.uncased else self.flush_cased(forced=forced)
 
-    def flush_uncased(self):
+    def flush_uncased(self, forced):
         if self.debug:
             logger.debug(f'[LCPHypothesisBuffer -> flush] Buffer n-1: {self.buffer}')
             logger.debug(f'[LCPHypothesisBuffer -> flush] Buffer n  : {self.new}')
+
+        if forced:
+            if self.new and self.buffer:
+                while self.new[0][2].lower() != self.buffer[0][2].lower():
+                    self.buffer.pop(0)
+                    if not self.buffer:
+                        break
+            if self.debug:
+                logger.debug(f'[LCPHypothesisBuffer -> flush] Buffer n-1 after cleanup: {self.buffer}')
 
         commit = []
         while self.new:
@@ -203,7 +212,7 @@ class LCPHypothesisBuffer(ABSHypothesisBuffer):
             logger.debug(f'[LCPHypothesisBuffer -> flush] Committing {commit}')
         return commit
 
-    def flush_cased(self):
+    def flush_cased(self, forced):
         if self.debug:
             logger.debug(f'[LCPHypothesisBuffer -> flush] Buffer n-1: {self.buffer}')
             logger.debug(f'[LCPHypothesisBuffer -> flush] Buffer n  : {self.new}')
@@ -234,6 +243,42 @@ class LCPHypothesisBuffer(ABSHypothesisBuffer):
     def pop_commited(self, time_limit):
         while self.commited_in_buffer and self.commited_in_buffer[0][1] <= time_limit:
             self.commited_in_buffer.pop(0)
+
+    def commit_anyway(self):
+        """
+        Commit the hypothesis buffer overriding the emission policy. Useful
+        when the policy gets stuck due to a certain token or timestamp blocking
+        the emission.
+
+        It checks commited_in_buffer to avoid commiting any already commited
+        word, and then returns the rest of words in the buffer
+        """
+        if self.debug:
+            logger.debug('[LCPHypothesisBuffer -> commit_anyway] Buffer n-1: {self.buffer}')
+        if len(self.buffer) >= 1:
+            a, b, t = self.buffer[0]
+            if self.commited_in_buffer:
+                c_len = len(self.commited_in_buffer)
+                b_len = len(self.buffer)
+
+                for i in range(1, min(c_len, n_len, 5) + 1):
+                    c = ' '.join(
+                        [self.commited_in_buffer[-j][2] for j in range(1, i + 1)][::-1]
+                    )
+                    tail = ' '.join(self.buffer[j - 1][2] for j in range(1, i + 1))
+
+                    if c == tail:
+                        words = []
+                        for j in range(i):
+                            words.append(repr(self.buffer.pop(0)))
+                        if self.debug:
+                            logger.debug(
+                                f'[LCPHypothesisBuffer -> commit_anyway] Last {i} items '
+                                + f'are shared between buffer and commited_in_buffer. Removing: '
+                                + ' '.join(words)
+                            )
+                        break
+        
 
     def complete(self):
         return self.buffer

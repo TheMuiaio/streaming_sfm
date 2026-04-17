@@ -36,6 +36,7 @@ class ParakeetStreamingStates(AgentStates):
     encoder_frame2audio_samples: int
     left_sample: int
     right_sample: int
+    nchunks_no_output: int
     incomplete_buffer: list
     dtype: torch.dtype
     device: torch.device
@@ -44,18 +45,13 @@ class ParakeetStreamingStates(AgentStates):
     def reset(self, cfg, asr_model):
         super().reset()
 
-        self.buffer = StreamingBatchedAudioBufferWithOffset(
-            batch_size=1,
-            context_samples=asr_model.context_samples,
-            dtype=asr_model.dtype,
-            device=asr_model.device,
-        )
-
+        self.buffer = self.reset_audio_buffer(asr_model)
         self.hyp_buffer = self.reset_hyp_buffer(cfg, asr_model)
         self.current_offset = 0
         self.encoder_frame2audio_samples = asr_model.encoder_frame2audio_samples
         self.left_sample = 0
         self.right_sample = asr_model.context_samples.chunk + asr_model.context_samples.right
+        self.nchunks_no_ouptut = 0
         self.incomplete_buffer = []
         self.dtype = asr_model.dtype
         self.device = asr_model.device
@@ -80,6 +76,17 @@ class ParakeetStreamingStates(AgentStates):
         else:
             hyp_buffer = HoldNHypothesisBuffer(cfg.N, word_level=word_level, debug=self.debug)
         return hyp_buffer
+
+    def reset_audio_buffer(self, asr_model):
+        buffer_len = self.buffer.get_buffer_len()[1]
+        self.current_offset += (buffer_len // self.encoder_frame2audio_samples)
+
+        return StreamingBatchedAudioBufferWithOffset(
+            batch_size=1,
+            context_samples=asr_model.context_samples,
+            dtype=asr_model.dtype,
+            device=asr_model.device,
+        )
 
     def update_source(self, segment):
         if segment.finished:
@@ -169,6 +176,11 @@ class ParakeetAgent(SpeechToTextAgent):
             left_context_secs=getattr(args, "sfm_left_context_secs", 20),
             right_context_secs=getattr(args, "sfm_right_context_secs", 0),
 
+            # ----------------------------------------------------------------
+            # NEW: max_empty_chunks
+            # ----------------------------------------------------------------
+            max_empty_chunks=getattr(args, "sfm_max_empty_chunks", 0),
+
             policy=getattr(args, "sfm_policy", "LACP"),
             lacp_threshold=getattr(args, "sfm_lacp_threshold", 2),
             K=getattr(args, "sfm_K", 2),
@@ -251,6 +263,14 @@ class ParakeetAgent(SpeechToTextAgent):
         parser.add_argument("--sfm_left_context_secs", type=float, default=20)
         parser.add_argument("--sfm_right_context_secs", type=float, default=0)
 
+        # ----------------------------------------------------------------
+        # NEW: max_empty_chunks
+        # When max_empty_chunks > 0, the LCP hyp_buffer is forced to clean the
+        # n-1 buffer, skipping any words that may be blocking the commitment of
+        # any new words.
+        # ----------------------------------------------------------------
+        parser.add_argument("--sfm_max_empty_chunks", type=int, default=0)
+
         # Emission Policies
         parser.add_argument("--sfm_policy", type=str, default="LACP",
                             choices=["LCP", "LACP", "SLCP", "WaitK", "HoldN"])
@@ -328,6 +348,7 @@ class ParakeetAgent(SpeechToTextAgent):
             encoder_frame2audio_samples=self.model.encoder_frame2audio_samples,
             left_sample=0,
             right_sample=self.model.context_samples.chunk + self.model.context_samples.right,
+            nchunks_no_output=0,
             incomplete_buffer=[],
             dtype=self.model.dtype,
             device=self.model.device,
@@ -347,10 +368,13 @@ class ParakeetAgent(SpeechToTextAgent):
 
         states.hyp_buffer.insert(hyp)
 
+        max_empty_chunks = getattr(self.cfg, 'max_empty_chunks', 0)
         if self.cfg.policy == 'WaitK':
             out = states.hyp_buffer.flush(
                 last_instant=states.left_sample // states.encoder_frame2audio_samples
             )
+        elif self.cfg.policy == 'LCP' and states.nchunks_no_output >= max_empty_chunks:
+            out = states.hyp_buffer.flush(forced=True)
         else:
             out = states.hyp_buffer.flush()
 
@@ -361,6 +385,14 @@ class ParakeetAgent(SpeechToTextAgent):
             out_text = self.model.asr_model.tokenizer.tokens_to_text(out_toks) if out_toks else ""
             logger.debug(f"[ASR] Source finished, will emit {out_text=}")
             return WriteAction(out_text, finished=True)
+
+        if max_empty_chunks:
+            if not out:
+                states.nchunks_no_output += 1
+                if states.nchunks_no_output >= max_empty_chunks:
+                    logger.info(f"ASR produced {max_empty_chunks} empty chunks. Forcing next commitment.")
+            else:
+                states.nchunks_no_output = 0
 
         if not out:
             logger.debug("[ASR] No output, emiting read")
@@ -416,6 +448,7 @@ class ParakeetAgent(SpeechToTextAgent):
             out_text = ''.join(t.replace('▁', ' ') for t in out_toks).strip()
         else:
             out_text = self.model.asr_model.tokenizer.tokens_to_text(out_toks)
+
 
         logger.info(f"ASR OUT {states.source_finished=} {out_text}")
         return WriteAction(out_text, finished=states.source_finished)

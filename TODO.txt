@@ -1,0 +1,8 @@
+El fallback de whisper (https://github.com/jorirsan/segfreetk/blob/main/src/segfreetk/models/vllm.py#L318)
+Comprovar si estic carregant el model de llenguatge soles (sense encoders extra)
+Revisar les tècniques de Jorge per evitar casos de no emitir
+Implementar el incremental ouptut
+
+Quan ja estiga tot implementat:
+- Provar Qwen3.5-{9B,27B} quantitzat
+- Provar algun altre model per contrastar

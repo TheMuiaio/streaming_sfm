@@ -58,6 +58,8 @@ def main():
         print(f"--- Initializing Streaming Parakeet ---")
         streamer = StreamingParakeet(cfg)
 
+    print(streamer.model.encoder_subsampling_factor)
+
     # 3. Load and Process Manifest
     with open(args.manifest_path, 'r') as f:
         records = [json.loads(line) for line in f]

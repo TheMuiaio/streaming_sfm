@@ -152,6 +152,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
                 cls.llm = LLM(
                     model=llm_model_name,
                     trust_remote_code=True,
+                    language_model_only=getattr(config, "llm_language_model_only", True),
                     gpu_memory_utilization=getattr(config, "llm_gpu_memory_utilization", 0.75),
                     tensor_parallel_size=getattr(config, "llm_tensor_parallel_size", 1),
                     max_num_seqs=1,

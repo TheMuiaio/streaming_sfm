@@ -4,6 +4,7 @@ latency_unit: "word"         # "char" for zh, "word" for de/it
 detokenizer_type: "simuleval"
 # MT (Qwen3.5-4B; unified instruct/chat checkpoint)
 llm_model_name: "Qwen/Qwen3.5-4B"
+llm_language_model_only: true  # vLLM: skip audio/video/image encoders; text-only MT
 llm_enable_thinking: false   # required for translation; true emits "Thinking Process:" only
 llm_gpu_memory_utilization: 0.62
 llm_max_model_len: 8192

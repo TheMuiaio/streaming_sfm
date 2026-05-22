@@ -1,5 +1,6 @@
 import logging
 import re
+import unicodedata
 import zlib
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -30,6 +31,41 @@ logging.getLogger("fbk_fairseq.simultaneous.metrics").setLevel(logging.INFO)
 
 # Default MT checkpoint when `llm_model_name` is omitted from config (vLLM / OpenAI-compatible).
 DEFAULT_LLM_MODEL_NAME = "Qwen/Qwen3.5-4B"
+
+# Clause/sentence punctuation immediately followed by a word (any Unicode letter).
+_PUNCT_GLUE_RE = re.compile(r"([,;:.!?])(\S)")
+# Model filler / thinking artifacts: "...", "…", or suffixes like "fait...".
+_ELLIPSIS_RE = re.compile(r"…|\.{2,}")
+
+
+def _starts_word_char(ch: str) -> bool:
+    """True when ch begins a new word (letters incl. É; not digits/punctuation)."""
+    return unicodedata.category(ch).startswith("L")
+
+
+def insert_space_after_punctuation(text: str) -> str:
+    """
+    Fix model-glued boundaries such as ``Sozialversicherung.Jede`` or ``PCNode.Émos``.
+
+    Skips digits after ``.`` so values like ``3.14`` / ``22.000`` stay intact.
+    """
+    if not text:
+        return text
+
+    def repl(match: re.Match) -> str:
+        following = match.group(2)
+        if _starts_word_char(following[0]):
+            return f"{match.group(1)} {following}"
+        return match.group(0)
+
+    return _PUNCT_GLUE_RE.sub(repl, text)
+
+
+def strip_ellipsis(text: str) -> str:
+    """Remove Unicode or ASCII ellipsis runs (e.g. ``...``, ``fait...``)."""
+    if not text:
+        return text
+    return _ELLIPSIS_RE.sub("", text)
 
 
 def longest_common_prefix(s1: str, s2: str) -> str:
@@ -170,6 +206,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
         self.source_lang = getattr(config, "source_lang", "English")
         self.target_lang = getattr(config, "target_lang", "German")
         self.target_sep = "" if self.target_lang in ["Chinese", "Japanese"] else " "
+        self._spaced_target = self.target_lang not in ["Chinese", "Japanese"]
         self.latency_unit = getattr(config, "latency_unit", "word")
 
         self.min_start_seconds = getattr(config, "min_start_seconds", 1.0)
@@ -289,7 +326,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
 
     def _asr_step(self, state: CascadeState, waveform: np.ndarray, is_last_chunk: bool) -> str:
         if (waveform is None or len(waveform) == 0) and not is_last_chunk:
-            logging.warning(f"[ASR] Received empty waveform. Returning empty string.")
+            logger.warning(f"[ASR] Received empty waveform. Returning empty string.")
             return ""
 
         if waveform is not None and len(waveform) > 0:
@@ -327,11 +364,11 @@ class CascadeSpeechProcessor(SpeechProcessor):
                 state.nchunks_no_output = 0
 
         if not out:
-            logging.info(f"[ASR] {self.asr_cfg.policy} policy generated no transcription. Emitting empty string")
+            logger.info(f"[ASR] {self.asr_cfg.policy} policy generated no transcription. Emitting empty string")
             return ""
         toks = [t for _, _, t in out]
         res = self._tokens_to_text(toks)
-        logging.info(f"[ASR] Emitting {res}")
+        logger.info(f"[ASR] Emitting {res}")
         return res
 
     def _count_prompt_tokens(self, prompt: str) -> int:
@@ -375,11 +412,25 @@ class CascadeSpeechProcessor(SpeechProcessor):
         prompt = self._apply_chat_template(messages)
         return prompt + prev_translation
 
+    def _normalize_translation_text(self, text: str) -> str:
+        if not text:
+            return text
+        text = strip_ellipsis(text)
+        if not self._spaced_target:
+            return text
+        return insert_space_after_punctuation(text)
+
+    def _trim_translation_increment(self, increment: str) -> str:
+        """Drop trailing whitespace only; keep leading spaces for word-level emission."""
+        if not increment or not self._spaced_target:
+            return increment
+        return increment.rstrip()
+
     def _sanitize_llm_output(self, text: str) -> str:
         """Drop Qwen thinking/reasoning prefixes if the model emits them anyway."""
         if not text:
             return ""
-        cleaned = text.replace("…", "").replace("\.{3}", "")
+        cleaned = strip_ellipsis(text)
         think_close = "</" + "think" + ">"
         if think_close in cleaned:
             cleaned = cleaned.split(think_close, 1)[-1]
@@ -389,7 +440,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
             cleaned,
             count=1,
         )
-        return cleaned.lstrip()
+        return self._normalize_translation_text(cleaned.lstrip())
 
     def _truncate_text_from_left(self, text: str, max_tokens: int) -> str:
         if max_tokens <= 0 or not text:
@@ -397,7 +448,8 @@ class CascadeSpeechProcessor(SpeechProcessor):
         token_ids = self.tokenizer.encode(text, add_special_tokens=False)
         if len(token_ids) <= max_tokens:
             return text
-        return self.tokenizer.decode(token_ids[-max_tokens:], skip_special_tokens=True)
+        decoded = self.tokenizer.decode(token_ids[-max_tokens:], skip_special_tokens=True)
+        return self._normalize_translation_text(decoded)
 
     def _fit_llm_prompt(self, asr_segment: str, prev_translation: str) -> tuple[str, str, str]:
         """
@@ -410,7 +462,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
         max_input_tokens = max(64, self._llm_max_model_len - reserve_tokens)
 
         asr_words = asr_segment.split()
-        prev = prev_translation
+        prev = self._normalize_translation_text(prev_translation)
         prompt = self._build_llm_prompt(asr_segment, prev)
         prompt_tokens = self._count_prompt_tokens(prompt)
 
@@ -441,7 +493,9 @@ class CascadeSpeechProcessor(SpeechProcessor):
             template = self._build_llm_prompt(asr_segment, "")
             template_tokens = self._count_prompt_tokens(template)
             prev_budget = max(0, max_input_tokens - template_tokens)
-            prev = self._truncate_text_from_left(prev, prev_budget)
+            prev = self._normalize_translation_text(
+                self._truncate_text_from_left(prev, prev_budget)
+            )
             prompt = self._build_llm_prompt(asr_segment, prev)
             prompt_tokens = self._count_prompt_tokens(prompt)
             logger.warning(
@@ -476,7 +530,9 @@ class CascadeSpeechProcessor(SpeechProcessor):
         else:
             words = prev.split()
             if len(words) >= n_units:
-                state.prev_translation = self.target_sep.join(words[:-n_units])
+                state.prev_translation = self._normalize_translation_text(
+                    self.target_sep.join(words[:-n_units])
+                )
             else:
                 state.prev_translation = ""
         state.translation_hypotheses = [state.prev_translation]
@@ -508,6 +564,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
                     "chat_template_kwargs": {"enable_thinking": self._llm_enable_thinking},
                 },
             )
+            logger.info(f"[LLM] Response: {response.choices[0].text}")
             return self._sanitize_llm_output(response.choices[0].text)
         sampling_params = SamplingParams(
             temperature=temp,
@@ -521,7 +578,9 @@ class CascadeSpeechProcessor(SpeechProcessor):
             sampling_params=sampling_params,
             use_tqdm=False,
         )
-        return self._sanitize_llm_output(llm_outputs[0].outputs[0].text)
+        llm_out = self._sanitize_llm_output(llm_outputs[0].outputs[0].text)
+        logger.info(f"[LLM] Response: {llm_out}")
+        return llm_out
 
     def _llm_generate_with_fallback(self, state: CascadeState, asr_text: str, prev_prefix: str) -> str:
         """
@@ -593,32 +652,33 @@ class CascadeSpeechProcessor(SpeechProcessor):
         if not asr_text:
             return ""
 
-        prev_prefix = state.prev_translation
+        prev_prefix = self._normalize_translation_text(state.prev_translation)
         hypothesis = self._llm_generate_with_fallback(state, asr_text, prev_prefix)
-        prev_prefix = state.prev_translation
-        full_hypothesis = prev_prefix + hypothesis
+        prev_prefix = self._normalize_translation_text(state.prev_translation)
+        full_hypothesis = self._normalize_translation_text(prev_prefix + hypothesis)
 
         if force_final:
             increment = full_hypothesis[len(prev_prefix) :]
             state.prev_translation = full_hypothesis
-            return increment.strip() if self.target_lang not in ["Chinese", "Japanese"] else increment
+            return self._trim_translation_increment(increment)
 
         state.translation_hypotheses.append(full_hypothesis)
-        stable = longest_common_prefix(
-            state.translation_hypotheses[-2],
-            state.translation_hypotheses[-1],
+        stable = self._normalize_translation_text(
+            longest_common_prefix(
+                state.translation_hypotheses[-2],
+                state.translation_hypotheses[-1],
+            )
         )
         increment = stable[len(prev_prefix) :]
         state.prev_translation = stable
-        if self.target_lang not in ["Chinese", "Japanese"]:
-            increment = increment.strip()
-        return increment
+        return self._trim_translation_increment(increment)
 
     def _text_to_tokens(self, text: str) -> List[str]:
         if text == "":
             return []
+        text = self._normalize_translation_text(text)
         if self.latency_unit in ["word", "spm"]:
-            return text.strip().split()
+            return [tok for tok in text.strip().split() if tok]
         if self.latency_unit == "char":
             return list(text.strip())
         raise NotImplementedError(f"Unsupported latency_unit: {self.latency_unit}")
@@ -627,13 +687,14 @@ class CascadeSpeechProcessor(SpeechProcessor):
         if text == "":
             return IncrementalOutput([], "", [], "")
 
+        text = self._trim_translation_increment(self._normalize_translation_text(text))
         out_text = text
         if self.latency_unit == "word" and self._state.emission_started and not out_text.startswith(" "):
             out_text = " " + out_text
         self._state.emission_started = True
 
         return IncrementalOutput(
-            new_tokens=self._text_to_tokens(text),
+            new_tokens=self._text_to_tokens(out_text),
             new_string=out_text,
             deleted_tokens=[],
             deleted_string="",
@@ -692,6 +753,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
     def set_target_language(self, language: str) -> None:
         self.target_lang = language
         self.target_sep = "" if language in ["Chinese", "Japanese"] else " "
+        self._spaced_target = language not in ["Chinese", "Japanese"]
 
     def tokens_to_string(self, tokens: List[str]) -> str:
         if self.latency_unit in ["word", "spm"]:

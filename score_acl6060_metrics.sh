@@ -42,7 +42,7 @@ declare -A TARGET_LANG=(
 if [[ $# -gt 0 ]]; then
   DIRECTIONS=("$@")
 else
-  DIRECTIONS=(en-de en-fr)
+  DIRECTIONS=(en-de en-fr en-pt)
 fi
 
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"

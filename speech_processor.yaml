@@ -2,10 +2,13 @@ type: "agent_simulstream.CascadeSpeechProcessor"
 speech_chunk_size: 0.96
 latency_unit: "word"         # "char" for zh, "word" for de/it
 detokenizer_type: "simuleval"
-# MT (Qwen3.5-4B; unified instruct/chat checkpoint)
+# MT (Qwen3.5; unified instruct/chat checkpoint — 4B default, 9B via speech_processor_qwen35_9b.yaml)
 llm_model_name: "Qwen/Qwen3.5-4B"
 llm_language_model_only: true  # vLLM: skip audio/video/image encoders; text-only MT
 llm_enable_thinking: false   # required for translation; true emits "Thinking Process:" only
+# llm_reasoning_parser: "qwen3"  # auto-set for Qwen3.5 when omitted
+# llm_dtype: "fp16"              # float16 weights; default for 9B if omitted (see speech_processor_qwen35_9b.yaml)
+# llm_enforce_eager: true        # recommended for Qwen3.5-9B (see speech_processor_qwen35_9b.yaml)
 llm_gpu_memory_utilization: 0.62
 llm_max_model_len: 8192
 # llm_base_url: "http://localhost:8000/v1"    # optional if using remote vLLM server

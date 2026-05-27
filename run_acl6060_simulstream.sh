@@ -21,6 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$SCRIPT_DIR"
 
 ACL6060_ROOT="${ACL6060_ROOT:-${HOME}/.cache/simuleval/acl_6060}"
+#SPEECH_CFG="${SPEECH_CFG:-${REPO_ROOT}/speech_processor_qwen35_9b.yaml}"
 SPEECH_CFG="${SPEECH_CFG:-${REPO_ROOT}/speech_processor.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/output/simulstream_acl6060}"
 PYTHON="${PYTHON:-python3}"
@@ -90,6 +91,8 @@ run_direction "en-pt" "English" "Portuguese"
 
 echo ""
 echo "Scoring with OmniSTEval (BLEU, chrF, LongYAAL, phrase report)..."
-"${REPO_ROOT}/score_acl6060_metrics.sh"
+#"${REPO_ROOT}/score_acl6060_metrics.sh en-de"
+#"${REPO_ROOT}/score_acl6060_metrics.sh en-fr"
+"${REPO_ROOT}/score_acl6060_metrics.sh en-pt"
 
 echo "Done. Wav list (for SimulStream): $WAV_LIST_FILE"

@@ -30,7 +30,45 @@ logger = logging.getLogger(__name__)
 logging.getLogger("fbk_fairseq.simultaneous.metrics").setLevel(logging.INFO)
 
 # Default MT checkpoint when `llm_model_name` is omitted from config (vLLM / OpenAI-compatible).
-DEFAULT_LLM_MODEL_NAME = "Qwen/Qwen3.5-4B"
+QWEN35_4B_MODEL_NAME = "Qwen/Qwen3.5-4B"
+QWEN35_9B_MODEL_NAME = "Qwen/Qwen3.5-9B"
+DEFAULT_LLM_MODEL_NAME = QWEN35_4B_MODEL_NAME
+
+
+def _is_qwen35_model(model_name: str) -> bool:
+    normalized = model_name.lower().replace("_", ".")
+    return "qwen3.5" in normalized
+
+
+def _normalize_llm_dtype(dtype: str) -> str:
+    """Map config aliases to vLLM ``dtype`` values."""
+    key = dtype.lower().strip()
+    aliases = {
+        "fp16": "float16",
+        "float16": "float16",
+        "half": "half",
+        "fp32": "float32",
+        "float32": "float32",
+        "float": "float",
+        "bf16": "bfloat16",
+        "bfloat16": "bfloat16",
+        "auto": "auto",
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"Unsupported llm_dtype={dtype!r}; use one of {sorted(aliases)}"
+        )
+    return aliases[key]
+
+
+def _resolve_llm_dtype(config: SimpleNamespace, llm_model_name: str) -> Optional[str]:
+    """Return vLLM dtype, defaulting Qwen3.5-9B to fp16 when VRAM is tight."""
+    explicit = getattr(config, "llm_dtype", None)
+    if explicit is not None:
+        return _normalize_llm_dtype(explicit)
+    if "9b" in llm_model_name.lower():
+        return "float16"
+    return None
 
 # Clause/sentence punctuation immediately followed by a word (any Unicode letter).
 _PUNCT_GLUE_RE = re.compile(r"([,;:.!?])(\S)")
@@ -69,10 +107,12 @@ def strip_ellipsis(text: str) -> str:
 
 
 def longest_common_prefix(s1: str, s2: str) -> str:
-    for i in range(min(len(s1), len(s2))):
-        if s1[i] != s2[i]:
-            return s1[:i]
-    return s1[: min(len(s1), len(s2))]
+    t1 = s1.split()
+    t2 = s2.split()
+    for i in range(min(len(t1), len(t2))):
+        if t1[i] != t2[i]:
+            return ' '.join(t1[:i])
+    return ' '.join(t1[: min(len(t1), len(t2))])
 
 
 @dataclass
@@ -96,8 +136,36 @@ class CascadeSpeechProcessor(SpeechProcessor):
     """
     SimulStream processor with:
     - ASR: Streaming SFM + Parakeet
-    - MT: Qwen3.5-4B via vLLM (local or OpenAI-compatible endpoint)
+    - MT: Qwen3.5 (e.g. 4B / 9B) via vLLM (local or OpenAI-compatible endpoint)
     """
+
+    @staticmethod
+    def _build_vllm_llm_kwargs(config: SimpleNamespace, llm_model_name: str) -> dict:
+        """vLLM EngineArgs for Qwen3.5 text-only MT (see vLLM Qwen3.5 recipe)."""
+        kwargs = {
+            "model": llm_model_name,
+            "trust_remote_code": True,
+            "language_model_only": getattr(config, "llm_language_model_only", True),
+            "gpu_memory_utilization": getattr(config, "llm_gpu_memory_utilization", 0.75),
+            "tensor_parallel_size": getattr(config, "llm_tensor_parallel_size", 1),
+            "max_num_seqs": 1,
+            "max_model_len": getattr(config, "llm_max_model_len", 8192),
+            "enable_prefix_caching": True,
+        }
+        if getattr(config, "llm_enforce_eager", False):
+            kwargs["enforce_eager"] = True
+        reasoning_parser = getattr(config, "llm_reasoning_parser", None)
+        if reasoning_parser is None and _is_qwen35_model(llm_model_name):
+            reasoning_parser = "qwen3"
+        if reasoning_parser:
+            kwargs["reasoning_parser"] = reasoning_parser
+        max_cudagraph = getattr(config, "llm_max_cudagraph_capture_size", None)
+        if max_cudagraph is not None:
+            kwargs["max_cudagraph_capture_size"] = max_cudagraph
+        llm_dtype = _resolve_llm_dtype(config, llm_model_name)
+        if llm_dtype is not None:
+            kwargs["dtype"] = llm_dtype
+        return kwargs
 
     @classmethod
     def load_model(cls, config: SimpleNamespace):
@@ -187,17 +255,11 @@ class CascadeSpeechProcessor(SpeechProcessor):
         else:
             cls.llm_client = None
             if not hasattr(cls, "llm") or cls.llm is None:
-                cls.llm = LLM(
-                    model=llm_model_name,
-                    trust_remote_code=True,
-                    language_model_only=getattr(config, "llm_language_model_only", True),
-                    gpu_memory_utilization=getattr(config, "llm_gpu_memory_utilization", 0.75),
-                    tensor_parallel_size=getattr(config, "llm_tensor_parallel_size", 1),
-                    max_num_seqs=1,
-                    max_model_len=getattr(config, "llm_max_model_len", 2048),
-                    enable_prefix_caching=True,
-                )
+                cls.llm = LLM(**cls._build_vllm_llm_kwargs(config, llm_model_name))
+                #from transformers import AutoTokenizer 
+
                 cls.tokenizer = cls.llm.get_tokenizer()
+                #cls.tokenizer = AutoTokenzier.from_pretrained(llm_model_name)
 
     def __init__(self, config: SimpleNamespace):
         super().__init__(config)
@@ -368,7 +430,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
             return ""
         toks = [t for _, _, t in out]
         res = self._tokens_to_text(toks)
-        logger.info(f"[ASR] Emitting {res}")
+        logger.info(f"[ASR] Emitting '{res}'")
         return res
 
     def _count_prompt_tokens(self, prompt: str) -> int:
@@ -416,9 +478,10 @@ class CascadeSpeechProcessor(SpeechProcessor):
         if not text:
             return text
         text = strip_ellipsis(text)
-        if not self._spaced_target:
-            return text
-        return insert_space_after_punctuation(text)
+        #if not self._spaced_target:
+        #    return text
+        return text
+        #return insert_space_after_punctuation(text)
 
     def _trim_translation_increment(self, increment: str) -> str:
         """Drop trailing whitespace only; keep leading spaces for word-level emission."""
@@ -548,6 +611,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
         state.consecutive_empty_mt = 0
 
     def _llm_generate(self, prompt: str, temperature: Optional[float] = None) -> str:
+        logger.debug(f"[LLM] Prompt: '{prompt}'")
         prompt_tokens = self._count_prompt_tokens(prompt)
         max_tokens = min(self._max_tokens, max(1, self._llm_max_model_len - prompt_tokens - 1))
         temp = self._temperature if temperature is None else temperature
@@ -564,7 +628,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
                     "chat_template_kwargs": {"enable_thinking": self._llm_enable_thinking},
                 },
             )
-            logger.info(f"[LLM] Response: {response.choices[0].text}")
+            logger.info(f"[LLM] Response: '{response.choices[0].text}'")
             return self._sanitize_llm_output(response.choices[0].text)
         sampling_params = SamplingParams(
             temperature=temp,
@@ -578,8 +642,9 @@ class CascadeSpeechProcessor(SpeechProcessor):
             sampling_params=sampling_params,
             use_tqdm=False,
         )
+        logger.debug(f"[LLM] Pre-sanitiized response: {self.tokenizer.convert_ids_to_tokens(llm_outputs[0].outputs[0].token_ids)}")
         llm_out = self._sanitize_llm_output(llm_outputs[0].outputs[0].text)
-        logger.info(f"[LLM] Response: {llm_out}")
+        logger.info(f"[LLM] Response: '{llm_out}'")
         return llm_out
 
     def _llm_generate_with_fallback(self, state: CascadeState, asr_text: str, prev_prefix: str) -> str:
@@ -655,9 +720,14 @@ class CascadeSpeechProcessor(SpeechProcessor):
         prev_prefix = self._normalize_translation_text(state.prev_translation)
         hypothesis = self._llm_generate_with_fallback(state, asr_text, prev_prefix)
         prev_prefix = self._normalize_translation_text(state.prev_translation)
-        full_hypothesis = self._normalize_translation_text(prev_prefix + hypothesis)
+        full_hypothesis = self._normalize_translation_text(f'{prev_prefix.strip()} {hypothesis}'.strip())
+
+        logger.debug(f"[LLM] Prev prefix: {prev_prefix}")
+        logger.debug(f"[LLM] Hypothesis: {hypothesis}")
+        logger.debug(f"[LLM] Full hypothesis: {full_hypothesis}")
 
         if force_final:
+            logger.debug(f"[LLM] Force final")
             increment = full_hypothesis[len(prev_prefix) :]
             state.prev_translation = full_hypothesis
             return self._trim_translation_increment(increment)
@@ -669,6 +739,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
                 state.translation_hypotheses[-1],
             )
         )
+        logger.info(f"[LLM] Stable: {' '.join(stable[len(prev_prefix):].strip().split())}")
         increment = stable[len(prev_prefix) :]
         state.prev_translation = stable
         return self._trim_translation_increment(increment)
@@ -702,6 +773,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
 
     @torch.inference_mode()
     def process_chunk(self, waveform: np.float32) -> IncrementalOutput:
+        logger.info(f"================ Performing new step ================")
         if waveform is None or len(waveform) == 0:
             return IncrementalOutput([], "", [], "")
 

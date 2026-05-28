@@ -21,12 +21,14 @@ from streaming_sfm.hyp_utils import (
     WaitKHypothesisBuffer,
 )
 from streaming_sfm.parakeet import _build_slcp_buffer
+from streaming_sfm import LOG_LEVEL
 from streaming_sfm.streaming_model import (
     StreamingBatchedAudioBufferWithOffset,
     StreamingParakeet,
 )
 
 logger = logging.getLogger(__name__)
+logger.setLevel(LOG_LEVEL)
 logging.getLogger("fbk_fairseq.simultaneous.metrics").setLevel(logging.INFO)
 
 # Default MT checkpoint when `llm_model_name` is omitted from config (vLLM / OpenAI-compatible).
@@ -611,7 +613,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
         state.consecutive_empty_mt = 0
 
     def _llm_generate(self, prompt: str, temperature: Optional[float] = None) -> str:
-        logger.debug(f"[LLM] Prompt: '{prompt}'")
+        #logger.debug(f"[LLM] Prompt: '{prompt}'")
         prompt_tokens = self._count_prompt_tokens(prompt)
         max_tokens = min(self._max_tokens, max(1, self._llm_max_model_len - prompt_tokens - 1))
         temp = self._temperature if temperature is None else temperature
@@ -659,6 +661,8 @@ class CascadeSpeechProcessor(SpeechProcessor):
             state.translation_hypotheses = [prev_prefix]
 
         hypothesis = self._llm_generate(prompt)
+
+        logger.debug(f"[LLM] RAW Hypothesis: {hypothesis}")
 
         if not hypothesis.strip():
             state.consecutive_empty_mt += 1
@@ -724,7 +728,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
 
         logger.debug(f"[LLM] Prev prefix: {prev_prefix}")
         logger.debug(f"[LLM] Hypothesis: {hypothesis}")
-        logger.debug(f"[LLM] Full hypothesis: {full_hypothesis}")
+        #logger.debug(f"[LLM] Full hypothesis: {full_hypothesis}")
 
         if force_final:
             logger.debug(f"[LLM] Force final")

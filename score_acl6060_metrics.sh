@@ -30,6 +30,7 @@ SPEECH_CFG="${SPEECH_CFG:-${REPO_ROOT}/speech_processor.yaml}"
 PYTHON="${PYTHON:-python3}"
 SCORING_DIR="${OUTPUT_DIR}/scoring_data"
 RESULTS_TSV="${OUTPUT_DIR}/scores.tsv"
+PREDICTS="${OUTPUT_DIR}/preds.txt"
 BLEU_TOKENIZER="${BLEU_TOKENIZER:-intl}"
 HTML_MAX_SEGS="${HTML_MAX_SEGS:-0}"
 
@@ -168,6 +169,11 @@ score_direction() {
       --max-instances "$HTML_MAX_SEGS"
     echo "Phrase report: ${out_dir}/phrase_report.html"
   fi
+
+  for id in 0 1 2 3 4; do
+    tmp=$(cat ${out_dir}/instances.resegmented.jsonl | grep '"docid": '${id} | jq -r '.prediction' | tr '\n' ' ')
+    echo ${tmp::-1} >> ${out_dir}/preds.txt
+  done
 
   echo "OmniSTEval outputs: ${out_dir}/"
 }

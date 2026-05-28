@@ -85,14 +85,14 @@ run_direction() {
 
 mkdir -p "$OUTPUT_DIR"
 
-#run_direction "en-de" "English" "German"
-#run_direction "en-fr" "English" "French"
+run_direction "en-de" "English" "German"
+run_direction "en-fr" "English" "French"
 run_direction "en-pt" "English" "Portuguese"
 
 echo ""
 echo "Scoring with OmniSTEval (BLEU, chrF, LongYAAL, phrase report)..."
-#"${REPO_ROOT}/score_acl6060_metrics.sh en-de"
-#"${REPO_ROOT}/score_acl6060_metrics.sh en-fr"
-"${REPO_ROOT}/score_acl6060_metrics.sh en-pt"
+"${REPO_ROOT}/score_acl6060_metrics.sh" en-de
+"${REPO_ROOT}/score_acl6060_metrics.sh" en-fr
+"${REPO_ROOT}/score_acl6060_metrics.sh" en-pt
 
 echo "Done. Wav list (for SimulStream): $WAV_LIST_FILE"

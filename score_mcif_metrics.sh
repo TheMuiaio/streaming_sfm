@@ -1,34 +1,21 @@
 #!/usr/bin/env bash
-# Score SimulStream metrics logs with OmniSTEval (IWSLT-style longform resegmentation).
-#
-# Produces corpus metrics (BLEU, chrF, LongYAAL, …), flickering stats (normalized erasure, RTF),
-# per-segment instances.resegmented.jsonl, and an HTML phrase-level diff report.
+# Score SimulStream metrics logs for MCIF with OmniSTEval longform resegmentation.
 #
 # Usage:
-#   ./score_acl6060_metrics.sh
-#   ./score_acl6060_metrics.sh dev
-#   ./score_acl6060_metrics.sh dev en-de en-pt
-#   ./score_acl6060_metrics.sh en-de en-pt
-#
-# Configuration: edit set_config.sh (or override env vars documented there).
-#
-# Requires: pip install 'OmniSTEval[simulstream]'   # optional: OmniSTEval[comet]
+#   ./score_mcif_metrics.sh
+#   ./score_mcif_metrics.sh en-de en-it
 
 set -euo pipefail
 
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/set_config.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/set_mcif_config.sh"
 
 declare -A TARGET_LANG=(
   [en-de]=de
-  [en-fr]=fr
-  [en-nl]=nl
-  [en-pt]=pt
-  [en-ru]=ru
-  [en-tr]=tr
+  [en-it]=it
 )
 
 declare -a DIRECTIONS
-acl6060_parse_split_and_directions DIRECTIONS "$@"
+mcif_parse_directions DIRECTIONS "$@"
 
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -53,20 +40,19 @@ find_python_with_omnisteval() {
 if ! find_python_with_omnisteval; then
   echo "error: OmniSTEval is required for scoring." >&2
   echo "Install with: pip install 'OmniSTEval[simulstream]'" >&2
-  echo "  optional COMET: pip install 'OmniSTEval[comet]'" >&2
   exit 1
 fi
 
 if ! "$PYTHON" -c "import simulstream" 2>/dev/null; then
-  echo "error: simulstream is required to read metrics logs (OmniSTEval[simulstream])." >&2
+  echo "error: simulstream is required to read metrics logs." >&2
   exit 1
 fi
 
-echo "Preparing ACL 60-60 references, sources, and speech segmentation (set=${ACL6060_SET})..."
-"$PYTHON" "${REPO_ROOT}/scripts/prepare_acl6060_scoring.py" \
-  --acl-root "$ACL6060_ROOT" \
+echo "Preparing MCIF references, sources, and speech segmentation (set=${MCIF_SET})..."
+"$PYTHON" "${REPO_ROOT}/scripts/prepare_mcif_scoring.py" \
+  --mcif-root "$MCIF_ROOT" \
   --output-dir "$OUTPUT_DIR" \
-  --set "$ACL6060_SET"
+  --set "$MCIF_SET"
 
 SEG_YAML="${SCORING_DIR}/audio_definition.yaml"
 if [[ ! -f "$SEG_YAML" ]]; then
@@ -93,7 +79,7 @@ append_simulstream_stats() {
   local out_dir="$3"
   local stats_json="${out_dir}/stats.json"
 
-  echo "Computing SimulStream stats (normalized erasure, RTF) from ${metrics_log}..."
+  echo "Computing SimulStream stats from ${metrics_log}..."
   "$PYTHON" - <<'PY' "$SPEECH_CFG" "$metrics_log" "$LATENCY_UNIT" "$stats_json" "$RESULTS_TSV" "$tag"
 import json
 import statistics
@@ -138,18 +124,12 @@ def percentile(values, pct):
     return ordered[idx]
 
 extra_stats = {
-    "chunks": {
-        "description": "Number of streaming chunks in the metrics log.",
-        "value": len(rows),
-    },
+    "chunks": {"description": "Number of streaming chunks in the metrics log.", "value": len(rows)},
     "generated_tokens_total": {
         "description": "Total generated target tokens, including tokens later deleted.",
         "value": generated_total,
     },
-    "deleted_tokens_total": {
-        "description": "Total deleted target tokens.",
-        "value": deleted_total,
-    },
+    "deleted_tokens_total": {"description": "Total deleted target tokens.", "value": deleted_total},
     "deletion_ratio": {
         "description": "Deleted target tokens divided by generated target tokens.",
         "value": deleted_total / generated_total if generated_total else 0.0,
@@ -193,74 +173,6 @@ for name, payload in stats.items():
 PY
 }
 
-ensure_comet_checkpoint() {
-  if [[ "${SKIP_COMET:-0}" == "1" ]]; then
-    return 0
-  fi
-  if ! "$PYTHON" -c "import comet" 2>/dev/null; then
-    return 0
-  fi
-
-  echo "Checking COMET model: ${COMET_MODEL}"
-  if ! "$PYTHON" - <<'PY' "$COMET_MODEL"
-import sys
-from pathlib import Path
-
-model_name = sys.argv[1]
-
-try:
-    from comet import download_model
-except ImportError:
-    sys.exit(0)
-
-try:
-    checkpoint = Path(download_model(model_name))
-except Exception as exc:
-    err = str(exc)
-    print(f"error: failed to download COMET model '{model_name}': {exc}", file=sys.stderr)
-    if "GatedRepoError" in err or "gated repo" in err.lower() or "authorized list" in err.lower():
-        print(
-            "\n"
-            f"Access to {model_name} is gated. While logged into Hugging Face, open:\n"
-            f"  https://huggingface.co/{model_name}\n"
-            "and accept the model terms (Log in -> Agree and access repository).\n"
-            "Then remove the incomplete cache and retry:\n"
-            f"  rm -rf \"$HOME/.cache/huggingface/hub/models--{model_name.replace('/', '--')}\"\n"
-            f"  huggingface-cli download {model_name}",
-            file=sys.stderr,
-        )
-    sys.exit(1)
-
-if checkpoint.is_file():
-    print(f"COMET checkpoint ready: {checkpoint}")
-    sys.exit(0)
-
-print(
-    f"error: COMET checkpoint missing after download attempt: {checkpoint}",
-    file=sys.stderr,
-)
-print(
-    "\n"
-    f"'{model_name}' requires a full Hugging Face download (~14 GB for XCOMET-XL).\n"
-    f"  1. Open https://huggingface.co/{model_name} and accept the model terms.\n"
-    "  2. Log in: huggingface-cli login\n"
-    f"  3. Remove any incomplete cache:\n"
-    f"     rm -rf \"$HOME/.cache/huggingface/hub/models--{model_name.replace('/', '--')}\"\n"
-    f"  4. Download the checkpoint:\n"
-    f"     huggingface-cli download {model_name}\n"
-    "  5. Re-run scoring with --score-only.\n"
-    "\n"
-    "To use the smaller default COMET-22 model instead:\n"
-    "  COMET_MODEL=Unbabel/wmt22-comet-da ./run_pac_experiments.sh --score-only",
-    file=sys.stderr,
-)
-sys.exit(1)
-PY
-  then
-    exit 1
-  fi
-}
-
 score_direction() {
   local tag="$1"
   local lang="${TARGET_LANG[$tag]:-}"
@@ -283,24 +195,21 @@ score_direction() {
   fi
 
   echo ""
-  echo "========== ${tag} (OmniSTEval longform, set=${ACL6060_SET}, lang=${lang}) =========="
+  echo "========== ${tag} (OmniSTEval longform, set=${MCIF_SET}, lang=${lang}) =========="
 
   local omnisteval_cmd=("$PYTHON" -m omnisteval.cli)
   if command -v omnisteval >/dev/null 2>&1; then
     omnisteval_cmd=(omnisteval)
   fi
 
-  #SEG_YAML=${ACL6060_ROOT}/${tag}_${ACL6060_SET}_refs.yaml
-  refs=${ACL6060_ROOT}/${tag}_${ACL6060_SET}_refs.${lang}
-  refs_src=${ACL6060_ROOT}/${tag}_${ACL6060_SET}_refs.en
   local -a cmd=(
     "${omnisteval_cmd[@]}" longform
     --speech_segmentation "$SEG_YAML"
     --ref_sentences_file "$ref_merged"
     --hypothesis_file "$metrics_log"
-    --source_sentences_file ${refs_src}
+    --source_sentences_file "$src_merged"
     --lang "$lang"
-    --bleu_tokenizer ${BLEU_TOKENIZER}
+    --bleu_tokenizer "${BLEU_TOKENIZER}"
     --output_folder "$out_dir"
     --hypothesis_format simulstream
     --simulstream_config_file "$SPEECH_CFG"
@@ -309,7 +218,7 @@ score_direction() {
 
   if [[ "${SKIP_COMET:-0}" != "1" ]]; then
     if [[ -f "$src_merged" ]] && "$PYTHON" -c "import comet" 2>/dev/null; then
-      cmd+=(--comet --comet_model "$COMET_MODEL" --source_sentences_file "$src_merged")
+      cmd+=(--comet --source_sentences_file "$src_merged")
     elif [[ ! -f "$src_merged" ]]; then
       echo "Skipping COMET (missing $src_merged)" >&2
     else
@@ -329,20 +238,35 @@ score_direction() {
     "$PYTHON" "${REPO_ROOT}/scripts/build_omnisteval_html_report.py" \
       --instances "$instances" \
       --output "${out_dir}/phrase_report.html" \
-      --title "ACL 60-60 ${ACL6060_SET} ${tag} — phrase-level errors" \
+      --title "MCIF ${MCIF_SET} ${tag} — phrase-level errors" \
       --max-instances "$HTML_MAX_SEGS"
     echo "Phrase report: ${out_dir}/phrase_report.html"
   fi
 
-  for id in 0 1 2 3 4; do
-    tmp=$(cat ${out_dir}/instances.resegmented.jsonl | grep '"docid": '${id} | jq -r '.prediction' | tr '\n' ' ')
-    echo ${tmp::-1} >> ${out_dir}/preds.txt
-  done
+  : >"${out_dir}/preds.txt"
+  if [[ -f "$instances" ]]; then
+    "$PYTHON" - <<'PY' "$instances" "${out_dir}/preds.txt"
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+instances_path = Path(sys.argv[1])
+preds_path = Path(sys.argv[2])
+by_doc: dict[int, list[str]] = defaultdict(list)
+for line in instances_path.read_text(encoding="utf-8").splitlines():
+    if not line.strip():
+        continue
+    row = json.loads(line)
+    by_doc[int(row["docid"])].append(row["prediction"])
+with preds_path.open("w", encoding="utf-8") as f:
+    for docid in sorted(by_doc):
+        f.write(" ".join(by_doc[docid]).strip() + "\n")
+PY
+  fi
 
   echo "OmniSTEval outputs: ${out_dir}/"
 }
-
-ensure_comet_checkpoint
 
 for tag in "${DIRECTIONS[@]}"; do
   score_direction "$tag"

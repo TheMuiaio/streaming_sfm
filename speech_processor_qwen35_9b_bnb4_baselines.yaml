@@ -1,0 +1,70 @@
+# CascadeSpeechProcessor (agent_simulstream_new): committed-ASR MT plus optional
+# speculative baselines (TAF, future SSBD). PAC/EAC remains in agent_simulstream.py.
+#
+# Usage:
+#   SPEECH_CFG=/path/to/speech_processor_qwen35_9b_bnb4_baselines.yaml ./run_acl6060_simulstream.sh
+#
+# TAF example overrides (see pac_experiment_manifest.yaml taf_* experiments):
+#   mt_lookahead_mode: taf
+#   taf_num_continuations: 10
+#   taf_max_pred_words: 6
+#   taf_agree_thres: 0.6
+
+type: "agent_simulstream_new.CascadeSpeechProcessor"
+speech_chunk_size: 0.64
+latency_unit: "word"
+detokenizer_type: "simuleval"
+llm_model_name: "Qwen/Qwen3.5-9B"
+llm_quantization: "4bit"
+llm_bnb_compute_dtype: "bfloat16"
+llm_language_model_only: true
+llm_enable_thinking: false
+llm_reasoning_parser: "qwen3"
+llm_enforce_eager: true
+llm_gpu_memory_utilization: 0.45
+llm_max_model_len: 8192
+min_start_seconds: 1.0
+max_new_tokens: 100
+temperature: 0.0
+top_p: 0.9
+top_k: 20
+repetition_penalty: 1.05
+temp_fall: true
+compression_ratio_threshold: 2.4
+iters_till_fallback: 4
+fallback_word_rollback: 2
+sfm_pretrained_name: "nvidia/parakeet-tdt-0.6b-v3"
+sfm_chunk_secs: 0.64
+sfm_left_context_secs: 20.0
+sfm_right_context_secs: 0.0
+sfm_policy: "LACP"
+sfm_lacp_threshold: 2.0
+sfm_word_level: true
+sfm_emit_incomplete: false
+sfm_device: "cuda"
+sfm_compute_dtype: "bfloat16"
+sfm_decode: 1
+
+# MT look-ahead: none | taf | ssbd (eac -> agent_simulstream.py)
+mt_lookahead_mode: none
+
+# TAF-style source anticipation (Ouyang et al., NAACL 2025)
+taf_num_continuations: 10
+taf_max_pred_words: 6
+taf_agree_thres: 0.6
+taf_min_start_words: 3
+taf_temperature: 0.7
+# taf_fix options: committed-only MT in vote pool, beam MT candidates, RALCP withhold
+taf_include_committed_hypothesis: false
+taf_mt_beam_width: 1
+taf_mt_beam_length_penalty: 1.0
+taf_ralcp_withhold: false
+
+# SSBD (Zeng et al., 2026): biased draft verification + optional display-only mask-k
+ssbd_bias_beta: 0.2
+ssbd_logit_bias_scale: 25.0
+ssbd_mask_k: 0
+# Option A: single greedy generate verifies draft prefix (beta=0) in one KV pass
+ssbd_batched_verify: false
+# Paper-faithful emission: emit full retranslations with deletions (no LCP / mask-k)
+ssbd_raw_emission: false

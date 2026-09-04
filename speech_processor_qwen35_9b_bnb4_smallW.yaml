@@ -1,0 +1,45 @@
+# CascadeSpeechProcessor: Qwen/Qwen3.5-9B with vLLM bitsandbytes 4-bit (inflight).
+# Requires: pip install 'bitsandbytes>=0.49.2'
+# Usage: SPEECH_CFG=/path/to/speech_processor_qwen35_9b_bnb4.yaml ./run_acl6060_simulstream.sh
+#
+# Remote vLLM (optional):
+#   vllm serve Qwen/Qwen3.5-9B --port 8000 --max-model-len 8192 \
+#     --quantization bitsandbytes --dtype bfloat16 --language-model-only \
+#     --reasoning-parser qwen3 --enable-prefix-caching --enforce-eager \
+#     --gpu-memory-utilization 0.45
+#   then set llm_base_url: "http://localhost:8000/v1"
+
+type: "agent_simulstream.CascadeSpeechProcessor"
+speech_chunk_size: 0.80
+latency_unit: "word"
+detokenizer_type: "simuleval"
+llm_model_name: "Qwen/Qwen3.5-9B"
+llm_quantization: "4bit"          # vLLM bitsandbytes inflight 4-bit weights
+llm_bnb_compute_dtype: "bfloat16"
+llm_language_model_only: true
+llm_enable_thinking: false
+llm_reasoning_parser: "qwen3"
+llm_enforce_eager: true           # required for bitsandbytes in vLLM
+llm_gpu_memory_utilization: 0.45
+llm_max_model_len: 8192
+min_start_seconds: 1.0
+max_new_tokens: 100
+temperature: 0.0
+top_p: 0.9
+top_k: 20
+repetition_penalty: 1.05
+temp_fall: true
+compression_ratio_threshold: 2.4
+iters_till_fallback: 4
+fallback_word_rollback: 2
+sfm_pretrained_name: "nvidia/parakeet-tdt-0.6b-v3"
+sfm_chunk_secs: 0.80
+sfm_left_context_secs: 20.0
+sfm_right_context_secs: 0.0
+sfm_policy: "LACP"
+sfm_lacp_threshold: 2.0
+sfm_word_level: true
+sfm_emit_incomplete: false
+sfm_device: "cuda"
+sfm_compute_dtype: "bfloat16"
+sfm_decode: 1

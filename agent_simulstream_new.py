@@ -275,6 +275,13 @@ class CascadeState:
     mt_llm_calls_utterance: int = 0
     ssbd_draft_accepted_tokens: int = 0
     ssbd_draft_total_tokens: int = 0
+    ssbd_verify_steps: int = 0
+    ssbd_verify_steps_zero_accept: int = 0
+    ssbd_cumulative_draft_tokens: int = 0
+    ssbd_cumulative_accepted_tokens: int = 0
+    displayed_hypothesis: str = ""
+    pending_new_tokens: List[str] = field(default_factory=list)
+    pending_deleted_tokens: List[str] = field(default_factory=list)
     emission_started: bool = False
     total_samples: int = 0
 
@@ -296,6 +303,8 @@ class CascadeSpeechProcessor(SpeechProcessor):
     - ``none``: committed ASR only (default)
     - ``taf``: TAF-style source anticipation via extra LLM calls
     - ``ssbd``: self-speculative biased decoding (Zeng et al., 2026)
+      Set ``ssbd_raw_emission: true`` to emit full retranslations with deletions
+      (paper-style NE) instead of LCP-stable append-only output.
     - ``eac``: use ``agent_simulstream.py`` (PAC / provisional ASR context)
     """
 
@@ -498,11 +507,21 @@ class CascadeSpeechProcessor(SpeechProcessor):
         self._taf_agree_thres = float(getattr(config, "taf_agree_thres", 0.6))
         self._taf_min_start_words = max(0, int(getattr(config, "taf_min_start_words", 3)))
         self._taf_temperature = float(getattr(config, "taf_temperature", 0.7))
+        self._taf_include_committed_hypothesis = bool(
+            getattr(config, "taf_include_committed_hypothesis", False)
+        )
+        self._taf_mt_beam_width = max(1, int(getattr(config, "taf_mt_beam_width", 1)))
+        self._taf_mt_beam_length_penalty = float(
+            getattr(config, "taf_mt_beam_length_penalty", 1.0)
+        )
+        self._taf_ralcp_withhold = bool(getattr(config, "taf_ralcp_withhold", False))
 
         # SSBD-style self-speculative biased decoding (Zeng et al., 2026).
         self._ssbd_bias_beta = float(getattr(config, "ssbd_bias_beta", 0.2))
         self._ssbd_mask_k = max(0, int(getattr(config, "ssbd_mask_k", 0)))
         self._ssbd_logit_bias_scale = float(getattr(config, "ssbd_logit_bias_scale", 25.0))
+        self._ssbd_batched_verify = bool(getattr(config, "ssbd_batched_verify", False))
+        self._ssbd_raw_emission = bool(getattr(config, "ssbd_raw_emission", False))
 
         self.sampling_params = SamplingParams(
             temperature=self._temperature,
@@ -813,6 +832,9 @@ class CascadeSpeechProcessor(SpeechProcessor):
             else:
                 state.prev_translation = ""
         state.translation_hypotheses = [state.prev_translation]
+        if self._ssbd_raw_emission and self._mt_lookahead_mode == MT_LOOKAHEAD_SSBD:
+            state.displayed_hypothesis = state.prev_translation
+            state.full_mt_hypothesis = state.prev_translation
         logger.warning(
             "[BAD STATE] Rolled back last %d translation unit(s); committed prefix is now %r",
             n_units,
@@ -826,6 +848,33 @@ class CascadeSpeechProcessor(SpeechProcessor):
         state.consecutive_empty_mt = 0
         state.ssbd_draft_accepted_tokens = 0
         state.ssbd_draft_total_tokens = 0
+        state.ssbd_verify_steps = 0
+        state.ssbd_verify_steps_zero_accept = 0
+        state.ssbd_cumulative_draft_tokens = 0
+        state.ssbd_cumulative_accepted_tokens = 0
+        state.displayed_hypothesis = ""
+        state.pending_new_tokens = []
+        state.pending_deleted_tokens = []
+
+    def _committed_translation_prefix(self, state: CascadeState) -> str:
+        if self._ssbd_raw_emission and self._mt_lookahead_mode == MT_LOOKAHEAD_SSBD:
+            return self._normalize_translation_text(state.displayed_hypothesis)
+        return self._normalize_translation_text(state.prev_translation)
+
+    def _compute_retranslation_token_delta(
+        self, old_text: str, new_text: str
+    ) -> tuple[List[str], List[str]]:
+        old_tokens = self._text_to_tokens(old_text)
+        new_tokens = self._text_to_tokens(new_text)
+        prefix_len = 0
+        for old_tok, new_tok in zip(old_tokens, new_tokens):
+            if old_tok == new_tok:
+                prefix_len += 1
+            else:
+                break
+        deleted = old_tokens[prefix_len:]
+        added = new_tokens[prefix_len:]
+        return added, deleted
 
     def _ssbd_verification_logit_bias(self) -> float:
         """Map paper bias ``beta`` in [0, 1] to an additive vLLM logit boost."""
@@ -842,11 +891,78 @@ class CascadeSpeechProcessor(SpeechProcessor):
         if not full_prev:
             return ""
         if prev and full_prev.startswith(prev):
-            return full_prev[len(prev) :].lstrip()
+            return full_prev[len(prev) :]
         if prev and prev in full_prev:
             idx = full_prev.index(prev) + len(prev)
-            return full_prev[idx:].lstrip()
+            return full_prev[idx:]
         return full_prev
+
+    def _ssbd_draft_token_ids(self, prompt: str, draft_suffix: str) -> List[int]:
+        """
+        Tokenize ``draft_suffix`` in the context of ``prompt``.
+
+        Standalone ``encode(draft_suffix)`` breaks BPE boundaries when ``prompt``
+        already ends with the committed translation prefix.
+        """
+        if not draft_suffix:
+            return []
+        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        combined_ids = self.tokenizer.encode(
+            prompt + draft_suffix,
+            add_special_tokens=False,
+        )
+        if len(combined_ids) <= len(prompt_ids):
+            return []
+        if combined_ids[: len(prompt_ids)] != prompt_ids:
+            logger.warning(
+                "[SSBD] Prompt is not a token prefix of prompt+draft; "
+                "falling back to contextual re-encode"
+            )
+        return combined_ids[len(prompt_ids) :]
+
+    def _ssbd_record_verify_step(self, state: CascadeState) -> None:
+        state.ssbd_verify_steps += 1
+        state.ssbd_cumulative_draft_tokens += state.ssbd_draft_total_tokens
+        state.ssbd_cumulative_accepted_tokens += state.ssbd_draft_accepted_tokens
+        if state.ssbd_draft_accepted_tokens == 0 and state.ssbd_draft_total_tokens > 0:
+            state.ssbd_verify_steps_zero_accept += 1
+
+    def _ssbd_log_step_acceptance(self, state: CascadeState) -> None:
+        total = state.ssbd_draft_total_tokens
+        accepted = state.ssbd_draft_accepted_tokens
+        if total <= 0:
+            return
+        rate = 100.0 * accepted / total
+        mode = "batched" if self._ssbd_batched_verify else "tokenwise"
+        beta = 0.0 if self._ssbd_batched_verify else self._ssbd_bias_beta
+        logger.info(
+            "[SSBD] Draft acceptance %d/%d tokens (%.1f%%, beta=%.2f, %s)",
+            accepted,
+            total,
+            rate,
+            beta,
+            mode,
+        )
+
+    def _ssbd_log_utterance_summary(self, state: CascadeState) -> None:
+        if state.ssbd_verify_steps <= 0:
+            return
+        draft_total = state.ssbd_cumulative_draft_tokens
+        accepted_total = state.ssbd_cumulative_accepted_tokens
+        token_rate = 100.0 * accepted_total / draft_total if draft_total else 0.0
+        zero_steps = state.ssbd_verify_steps_zero_accept
+        step_rate = 100.0 * zero_steps / state.ssbd_verify_steps
+        logger.info(
+            "[SSBD] Utterance %d summary: verify_steps=%d, "
+            "token_acceptance=%d/%d (%.1f%%), zero_accept_steps=%d (%.1f%%)",
+            state.speech_id,
+            state.ssbd_verify_steps,
+            accepted_total,
+            draft_total,
+            token_rate,
+            zero_steps,
+            step_rate,
+        )
 
     def _ssbd_apply_display_mask(self, increment: str) -> str:
         """Display-only mask-k: hide the last k emitted words from the user."""
@@ -927,13 +1043,85 @@ class CascadeSpeechProcessor(SpeechProcessor):
         token_ids = list(output.token_ids)
         return text, token_ids
 
-    def _ssbd_generate_from_draft(
+    def _ssbd_count_draft_acceptance(
+        self,
+        generated_ids: List[int],
+        draft_token_ids: List[int],
+    ) -> int:
+        compare_len = min(len(generated_ids), len(draft_token_ids))
+        for i in range(compare_len):
+            if generated_ids[i] != draft_token_ids[i]:
+                logger.debug(
+                    "[SSBD] Draft mismatch at token %d: draft=%s generated=%s "
+                    "(draft_tok=%r gen_tok=%r)",
+                    i,
+                    draft_token_ids[i],
+                    generated_ids[i],
+                    self.tokenizer.decode(
+                        [draft_token_ids[i]], skip_special_tokens=False
+                    ),
+                    self.tokenizer.decode(
+                        [generated_ids[i]], skip_special_tokens=False
+                    ),
+                )
+                return i
+        return compare_len
+
+    def _ssbd_generate_from_draft_batched(
         self,
         state: CascadeState,
         prompt: str,
         draft_suffix: str,
     ) -> str:
-        draft_token_ids = self.tokenizer.encode(draft_suffix, add_special_tokens=False)
+        """
+        Option A: one greedy generate verifies the draft prefix (beta=0) and
+        continues in the same KV-cached pass instead of per-token prefills.
+        """
+        draft_token_ids = self._ssbd_draft_token_ids(prompt, draft_suffix)
+        state.ssbd_draft_total_tokens = len(draft_token_ids)
+        state.ssbd_draft_accepted_tokens = 0
+
+        if not draft_token_ids:
+            text, _ = self._llm_generate_on_prompt(state, prompt)
+            return text
+
+        if self._ssbd_bias_beta > 0.0:
+            logger.debug(
+                "[SSBD] batched verify ignores ssbd_bias_beta=%.2f (uses beta=0)",
+                self._ssbd_bias_beta,
+            )
+
+        prompt_tokens = self._count_prompt_tokens(prompt)
+        remaining = min(
+            self._max_tokens,
+            max(1, self._llm_max_model_len - prompt_tokens - 1),
+        )
+        max_tokens = min(
+            len(draft_token_ids) + remaining,
+            max(1, self._llm_max_model_len - prompt_tokens - 1),
+        )
+
+        text, generated_ids = self._llm_generate_on_prompt(
+            state,
+            prompt,
+            temperature=0.0,
+            max_tokens=max_tokens,
+        )
+        state.ssbd_draft_accepted_tokens = self._ssbd_count_draft_acceptance(
+            generated_ids, draft_token_ids
+        )
+
+        self._ssbd_record_verify_step(state)
+        self._ssbd_log_step_acceptance(state)
+        return self._normalize_translation_text(text)
+
+    def _ssbd_generate_from_draft_tokenwise(
+        self,
+        state: CascadeState,
+        prompt: str,
+        draft_suffix: str,
+    ) -> str:
+        draft_token_ids = self._ssbd_draft_token_ids(prompt, draft_suffix)
         state.ssbd_draft_total_tokens = len(draft_token_ids)
         state.ssbd_draft_accepted_tokens = 0
 
@@ -946,7 +1134,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
         logit_boost = self._ssbd_verification_logit_bias()
 
         for draft_id in draft_token_ids:
-            _, generated_ids = self._llm_generate_on_prompt(
+            piece, generated_ids = self._llm_generate_on_prompt(
                 state,
                 working_prompt,
                 temperature=0.0,
@@ -958,16 +1146,21 @@ class CascadeSpeechProcessor(SpeechProcessor):
             generated_id = generated_ids[0]
             if generated_id != draft_id:
                 logger.debug(
-                    "[SSBD] Draft mismatch at token %d: draft=%s generated=%s",
+                    "[SSBD] Draft mismatch at token %d: draft=%s generated=%s "
+                    "(draft_tok=%r gen_tok=%r)",
                     state.ssbd_draft_accepted_tokens,
                     draft_id,
                     generated_id,
+                    self.tokenizer.decode([draft_id], skip_special_tokens=False),
+                    self.tokenizer.decode([generated_id], skip_special_tokens=False),
                 )
                 break
-            piece = self.tokenizer.decode([generated_id], skip_special_tokens=True)
             accepted_parts.append(piece)
             working_prompt += piece
             state.ssbd_draft_accepted_tokens += 1
+
+        self._ssbd_record_verify_step(state)
+        self._ssbd_log_step_acceptance(state)
 
         prompt_tokens = self._count_prompt_tokens(working_prompt)
         remaining = min(
@@ -980,13 +1173,17 @@ class CascadeSpeechProcessor(SpeechProcessor):
             max_tokens=remaining,
         )
         accepted = "".join(accepted_parts)
-        logger.info(
-            "[SSBD] Draft acceptance %d/%d tokens (beta=%.2f)",
-            state.ssbd_draft_accepted_tokens,
-            state.ssbd_draft_total_tokens,
-            self._ssbd_bias_beta,
-        )
         return self._normalize_translation_text(f"{accepted}{suffix}")
+
+    def _ssbd_generate_from_draft(
+        self,
+        state: CascadeState,
+        prompt: str,
+        draft_suffix: str,
+    ) -> str:
+        if self._ssbd_batched_verify:
+            return self._ssbd_generate_from_draft_batched(state, prompt, draft_suffix)
+        return self._ssbd_generate_from_draft_tokenwise(state, prompt, draft_suffix)
 
     def _ssbd_generate_with_fallback(
         self,
@@ -1039,6 +1236,29 @@ class CascadeSpeechProcessor(SpeechProcessor):
         self._reset_translation_state(state)
         return ""
 
+    def _finalize_ssbd_raw_emission(
+        self,
+        state: CascadeState,
+        full_hypothesis: str,
+    ) -> str:
+        full_hypothesis = self._normalize_translation_text(full_hypothesis)
+        state.full_mt_hypothesis = full_hypothesis
+        added, deleted = self._compute_retranslation_token_delta(
+            state.displayed_hypothesis,
+            full_hypothesis,
+        )
+        state.displayed_hypothesis = full_hypothesis
+        state.prev_translation = full_hypothesis
+        state.pending_new_tokens = added
+        state.pending_deleted_tokens = deleted
+        logger.info(
+            "[SSBD raw] deleted=%r added=%r (displayed_len=%d)",
+            deleted,
+            added,
+            len(self._text_to_tokens(full_hypothesis)),
+        )
+        return ""
+
     def _finalize_ssbd_translation_step(
         self,
         state: CascadeState,
@@ -1046,6 +1266,9 @@ class CascadeSpeechProcessor(SpeechProcessor):
         full_hypothesis: str,
         force_final: bool,
     ) -> str:
+        if self._ssbd_raw_emission:
+            return self._finalize_ssbd_raw_emission(state, full_hypothesis)
+
         state.full_mt_hypothesis = full_hypothesis
 
         if force_final:
@@ -1163,6 +1386,62 @@ class CascadeSpeechProcessor(SpeechProcessor):
                 texts.append(self._sanitize_llm_output(completion.text))
         return texts
 
+    def _llm_beam_search_batch(
+        self,
+        state: CascadeState,
+        prompts: Sequence[str],
+    ) -> List[str]:
+        """Beam-search MT for each prompt; return all beam increments (flattened)."""
+        if not prompts:
+            return []
+
+        beam_width = self._taf_mt_beam_width
+        max_tokens_list: List[int] = []
+        for prompt in prompts:
+            prompt_tokens = self._count_prompt_tokens(prompt)
+            max_tokens_list.append(
+                min(self._max_tokens, max(1, self._llm_max_model_len - prompt_tokens - 1))
+            )
+        batch_max_tokens = max(max_tokens_list)
+
+        if self.llm_client is not None:
+            outputs: List[str] = []
+            for prompt in prompts:
+                response = self.llm_client.completions.create(
+                    model=self._llm_model_name,
+                    prompt=prompt,
+                    max_tokens=batch_max_tokens,
+                    temperature=0.0,
+                    n=beam_width,
+                    extra_body={
+                        "use_beam_search": True,
+                        "best_of": beam_width,
+                        "length_penalty": self._taf_mt_beam_length_penalty,
+                        "repetition_penalty": self._repetition_penalty,
+                        "chat_template_kwargs": {"enable_thinking": self._llm_enable_thinking},
+                    },
+                )
+                for choice in response.choices:
+                    outputs.append(self._sanitize_llm_output(choice.text))
+            self._record_llm_calls(state, len(prompts))
+            return outputs
+
+        from vllm.sampling_params import BeamSearchParams
+
+        beam_params = BeamSearchParams(
+            beam_width=beam_width,
+            max_tokens=batch_max_tokens,
+            length_penalty=self._taf_mt_beam_length_penalty,
+        )
+        llm_outputs = self.llm.beam_search(list(prompts), beam_params)
+        self._record_llm_calls(state, len(prompts))
+
+        texts: List[str] = []
+        for request_output in llm_outputs:
+            for sequence in request_output.sequences:
+                texts.append(self._sanitize_llm_output(sequence.text))
+        return texts
+
     def _predict_source_continuations(self, state: CascadeState, committed_asr: str) -> List[str]:
         prompt = self._build_source_continuation_prompt(committed_asr)
         cont_max_tokens = max(8, self._taf_max_pred_words * 4)
@@ -1233,14 +1512,21 @@ class CascadeSpeechProcessor(SpeechProcessor):
         prev_prefix: str,
     ) -> List[str]:
         prev_prefix = self._normalize_translation_text(prev_prefix)
+        cont_list = list(continuations)
+        if self._taf_include_committed_hypothesis and "" not in cont_list:
+            cont_list = [""] + cont_list
+
         prompts: List[str] = []
-        for cont in continuations:
+        for cont in cont_list:
             source = f"{committed_asr} {cont}".strip() if cont else committed_asr
             prompt, _, _ = self._fit_llm_prompt(source, prev_prefix)
             prompts.append(prompt)
 
-        increments = self._llm_generate_raw_batch(prompts, temperature=self._temperature)
-        self._record_llm_calls(state, len(prompts))
+        if self._taf_mt_beam_width > 1:
+            increments = self._llm_beam_search_batch(state, prompts)
+        else:
+            increments = self._llm_generate_raw_batch(prompts, temperature=self._temperature)
+            self._record_llm_calls(state, len(prompts))
 
         full_hypotheses: List[str] = []
         for increment in increments:
@@ -1248,7 +1534,32 @@ class CascadeSpeechProcessor(SpeechProcessor):
                 f"{prev_prefix.strip()} {increment}".strip()
             )
             full_hypotheses.append(full_hyp)
+        logger.info(
+            "[TAF] MT candidates: %d prompt(s), %d hypothesis(es), beam=%d, committed=%s",
+            len(prompts),
+            len(full_hypotheses),
+            self._taf_mt_beam_width,
+            self._taf_include_committed_hypothesis,
+        )
         return full_hypotheses
+
+    def _taf_voted_increment(
+        self,
+        prev_prefix: str,
+        hypotheses: Sequence[str],
+    ) -> tuple[str, str]:
+        """Return (voted_full_hypothesis, agreed_increment_after_prev_prefix)."""
+        prev_prefix = self._normalize_translation_text(prev_prefix)
+        voted_full = self._normalize_translation_text(
+            majority_vote_prefix(hypotheses, self._taf_agree_thres)
+        )
+        if voted_full.startswith(prev_prefix):
+            increment = voted_full[len(prev_prefix) :].strip()
+        elif prev_prefix.startswith(voted_full):
+            increment = ""
+        else:
+            increment = voted_full.strip()
+        return voted_full, increment
 
     def _translate_with_taf_lookahead(
         self,
@@ -1272,13 +1583,22 @@ class CascadeSpeechProcessor(SpeechProcessor):
         hypotheses = self._taf_translate_hypotheses(
             state, committed_asr, continuations, prev_prefix
         )
-        voted_full = self._normalize_translation_text(
-            majority_vote_prefix(hypotheses, self._taf_agree_thres)
-        )
+        voted_full, voted_increment = self._taf_voted_increment(prev_prefix, hypotheses)
+
+        if self._taf_ralcp_withhold and not force_final:
+            if not voted_increment:
+                logger.info(
+                    "[TAF] RALCP withhold: no agreed increment (%d hypotheses, thres=%.2f)",
+                    len(hypotheses),
+                    self._taf_agree_thres,
+                )
+                return ""
+
         if not voted_full:
             voted_full = self._normalize_translation_text(
                 max(hypotheses, key=len) if hypotheses else prev_prefix
             )
+
         logger.info(
             "[TAF] Majority vote (%d hypotheses, thres=%.2f): %r",
             len(hypotheses),
@@ -1296,7 +1616,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
         prev_prefix: str,
         force_final: bool,
     ) -> str:
-        if self.llm_client is not None:
+        if self.llm_client is not None and not self._ssbd_batched_verify:
             logger.warning(
                 "[SSBD] Remote OpenAI-compatible backend lacks verified logit_bias "
                 "support; falling back to standard re-translation."
@@ -1424,7 +1744,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
         if not asr_text:
             return ""
 
-        prev_prefix = self._normalize_translation_text(state.prev_translation)
+        prev_prefix = self._committed_translation_prefix(state)
 
         if self._mt_lookahead_mode == MT_LOOKAHEAD_TAF:
             increment = self._translate_with_taf_lookahead(
@@ -1463,15 +1783,22 @@ class CascadeSpeechProcessor(SpeechProcessor):
         raise NotImplementedError(f"Unsupported latency_unit: {self.latency_unit}")
 
     def _build_incremental_output(self, stable_increment: str) -> IncrementalOutput:
-        stable_increment = self._trim_translation_increment(
-            self._normalize_translation_text(stable_increment or "")
-        )
-        new_tokens = self._text_to_tokens(stable_increment)
+        if self._ssbd_raw_emission and self._mt_lookahead_mode == MT_LOOKAHEAD_SSBD:
+            new_tokens = list(self._state.pending_new_tokens)
+            deleted_tokens = list(self._state.pending_deleted_tokens)
+            self._state.pending_new_tokens = []
+            self._state.pending_deleted_tokens = []
+        else:
+            stable_increment = self._trim_translation_increment(
+                self._normalize_translation_text(stable_increment or "")
+            )
+            new_tokens = self._text_to_tokens(stable_increment)
+            deleted_tokens = []
 
-        if not new_tokens:
+        if not new_tokens and not deleted_tokens:
             return IncrementalOutput([], "", [], "")
 
-        new_string = self.tokens_to_string(new_tokens)
+        new_string = self.tokens_to_string(new_tokens) if new_tokens else ""
         if (
             self.latency_unit == "word"
             and self._state.emission_started
@@ -1480,14 +1807,22 @@ class CascadeSpeechProcessor(SpeechProcessor):
         ):
             new_string = " " + new_string
 
-        if new_tokens:
+        deleted_string = self.tokens_to_string(deleted_tokens) if deleted_tokens else ""
+        if new_tokens or deleted_tokens:
             self._state.emission_started = True
+
+        if deleted_tokens:
+            logger.info(
+                "[SSBD raw] Retracting %r; emitting %r",
+                deleted_string,
+                new_string,
+            )
 
         return IncrementalOutput(
             new_tokens=new_tokens,
             new_string=new_string,
-            deleted_tokens=[],
-            deleted_string="",
+            deleted_tokens=deleted_tokens,
+            deleted_string=deleted_string,
         )
 
     @torch.inference_mode()
@@ -1536,6 +1871,8 @@ class CascadeSpeechProcessor(SpeechProcessor):
                 self._state.asr_committed_text = asr_increment.strip()
 
         translation = self._translate_from_asr(self._state, force_final=True)
+        if self._mt_lookahead_mode == MT_LOOKAHEAD_SSBD:
+            self._ssbd_log_utterance_summary(self._state)
         logger.info(
             "[MT] Utterance %d finished; total LLM calls=%d",
             self._state.speech_id,

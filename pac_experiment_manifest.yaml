@@ -11,8 +11,8 @@
 
 output_root: output/pac_experiments
 #directions: [en-de, en-fr, en-nl, en-pt, en-ru, en-tr]
-directions: [en-nl, en-ru, en-tr]
-#directions: [en-de, en-fr, en-pt]
+#directions: [en-nl, en-ru, en-tr]
+directions: [en-de, en-fr, en-pt]
 #directions: [en-de, en-fr]
 base_config: speech_processor_qwen35_9b_bnb4_smallerW.yaml
 
@@ -20,6 +20,17 @@ experiments:
   - id: committed_asr_lacp096
     group: main
     label: Committed ASR only, LACP 0.96s
+    description: Primary committed-ASR-only baseline (central comparison).
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: false
+
+  - id: committed_asr_check_lacp096
+    group: main
+    label: Committed ASR only sanity-check, LACP 0.96s
     description: Primary committed-ASR-only baseline (central comparison).
     overrides:
       speech_chunk_size: 0.96
@@ -41,6 +52,17 @@ experiments:
       pac_use_alignment_boundary: true
       pac_emit_provisional_target: true
 
+  - id: aggressive_asr_true_lacp096
+    group: baseline
+    label: Aggressive committed ASR, LACP threshold 5.0, 0.96s
+    description: Tests whether PAC beats simply committing ASR earlier, at the central operating point.
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 5.0
+      sfm_speculative: false
+
   - id: aggressive_asr_lacp096
     group: baseline
     label: Aggressive committed ASR, LACP threshold 1.0, 0.96s
@@ -51,6 +73,185 @@ experiments:
       sfm_policy: LACP
       sfm_lacp_threshold: 1.0
       sfm_speculative: false
+
+  - id: taf_lacp096
+    group: baseline
+    label: TAF source anticipation, LACP 0.96s (n=10)
+    description: Speculative baseline with predicted source continuations and majority-vote MT.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: taf
+      taf_num_continuations: 10
+      taf_max_pred_words: 6
+      taf_agree_thres: 0.6
+      taf_min_start_words: 3
+      taf_temperature: 0.7
+
+  - id: taf_fix_lacp096
+    group: baseline
+    label: TAF fix (committed pool + RALCP), LACP 0.96s
+    description: TAF with committed-only MT in the vote pool and RALCP-style withhold on failed vote (no beam search for now).
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: taf
+      taf_num_continuations: 10
+      taf_max_pred_words: 6
+      taf_agree_thres: 0.6
+      taf_min_start_words: 3
+      taf_temperature: 0.7
+      taf_include_committed_hypothesis: true
+      taf_mt_beam_width: 1
+      taf_ralcp_withhold: true
+
+  - id: taf3_fix_lacp096
+    group: baseline
+    label: TAF fix n=6 (committed pool + RALCP), LACP 0.96s
+    description: Same as taf_fix_lacp096 but with 6 source continuations instead of 10 for lower compute.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: taf
+      taf_num_continuations: 3
+      taf_max_pred_words: 6
+      taf_agree_thres: 0.6
+      taf_min_start_words: 3
+      taf_temperature: 0.7
+      taf_include_committed_hypothesis: true
+      taf_mt_beam_width: 1
+      taf_ralcp_withhold: true
+
+  - id: taf6_fix_lacp096
+    group: baseline
+    label: TAF fix n=6 (committed pool + RALCP), LACP 0.96s
+    description: Same as taf_fix_lacp096 but with 6 source continuations instead of 10 for lower compute.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: taf
+      taf_num_continuations: 6
+      taf_max_pred_words: 6
+      taf_agree_thres: 0.6
+      taf_min_start_words: 3
+      taf_temperature: 0.7
+      taf_include_committed_hypothesis: true
+      taf_mt_beam_width: 1
+      taf_ralcp_withhold: true
+
+  - id: taf1_lacp096
+    group: baseline
+    label: TAF-1 greedy continuation, LACP 0.96s (n=1)
+    description: Cheap TAF sanity check with one greedy source continuation per step.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: taf
+      taf_num_continuations: 1
+      taf_max_pred_words: 6
+      taf_agree_thres: 1.0
+      taf_min_start_words: 3
+      taf_temperature: 0.0
+
+  - id: ssbd_lacp096
+    group: baseline
+    label: SSBD re-translation, LACP 0.96s (beta=0.2)
+    description: Self-speculative biased decoding baseline for faster re-translation compute.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: ssbd
+      ssbd_bias_beta: 0.2
+      ssbd_mask_k: 0
+
+  - id: ssbd_batched_lacp096
+    group: baseline
+    label: SSBD batched verify (beta=0), LACP 0.96s
+    description: Single-call greedy draft verification (Option A); one vLLM generate per step instead of per-token prefills.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: ssbd
+      ssbd_batched_verify: true
+      ssbd_bias_beta: 0.0
+      ssbd_mask_k: 0
+
+  - id: ssbd_raw_batched_lacp096
+    group: baseline
+    label: SSBD raw batched verify (paper emission), LACP 0.96s
+    description: Batched SSBD with full retranslation emission (no LCP stabilization or display mask-k); should yield NE>0 like the original paper.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: ssbd
+      ssbd_batched_verify: true
+      ssbd_bias_beta: 0.0
+      ssbd_mask_k: 0
+      ssbd_raw_emission: true
+
+  - id: ssbd_lacp064
+    group: chunk_grid
+    label: SSBD re-translation, LACP 0.64s (beta=0.2)
+    description: Smaller acoustic window ablation for SSBD draft acceptance.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.64
+      sfm_chunk_secs: 0.64
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: ssbd
+      ssbd_bias_beta: 0.2
+      ssbd_mask_k: 0
+
+  - id: ssbd_maskk5_lacp096
+    group: baseline
+    label: SSBD + display-only mask-5, LACP 0.96s
+    description: SSBD with display-only mask-k (k=5) to reduce flicker without losing draft tokens.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: ssbd
+      ssbd_bias_beta: 0.2
+      ssbd_mask_k: 5
+
+  - id: committed_asr_new_lacp096
+    group: baseline
+    label: Committed ASR only (agent_simulstream_new), LACP 0.96s
+    description: Fair committed-ASR control using the same agent as TAF/SSBD baselines.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: none
 
   - id: committed_asr_lacp064
     group: chunk_grid

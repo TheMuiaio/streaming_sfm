@@ -23,6 +23,7 @@ from streaming_sfm.hyp_utils import (
 )
 from streaming_sfm.parakeet import _build_slcp_buffer
 from streaming_sfm import LOG_LEVEL
+from streaming_sfm.eval_progress import build_eval_progress_index, format_step_banner
 from streaming_sfm.streaming_model import (
     StreamingBatchedAudioBufferWithOffset,
     StreamingParakeet,
@@ -542,6 +543,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
         self._needs_resample = self._input_sample_rate != self._asr_sample_rate
 
         speech_chunk_size = getattr(config, "speech_chunk_size", None)
+        self._speech_chunk_size = float(speech_chunk_size) if speech_chunk_size is not None else None
         self._expected_input_chunk_samples = None
         if speech_chunk_size is not None:
             # Expected samples for a "full" SimulStream chunk. The final chunk
@@ -549,6 +551,12 @@ class CascadeSpeechProcessor(SpeechProcessor):
             self._expected_input_chunk_samples = int(round(float(speech_chunk_size) * self._input_sample_rate))
 
         self._saw_last_nonempty_chunk = False
+        self._chunk_step = 0
+        self._eval_progress = None
+        if self._speech_chunk_size is not None:
+            self._eval_progress = build_eval_progress_index(
+                self._speech_chunk_size, config=config
+            )
         logger.info(
             "Audio sample rates: simulstream=%s Hz, asr=%s Hz, resample=%s",
             self._input_sample_rate,
@@ -818,7 +826,10 @@ class CascadeSpeechProcessor(SpeechProcessor):
         return len(text_bytes) / len(compressed)
 
     def _rollback_translation(self, state: CascadeState, n_units: int) -> None:
-        prev = state.prev_translation
+        if self._ssbd_raw_emission and self._mt_lookahead_mode == MT_LOOKAHEAD_SSBD:
+            prev = state.displayed_hypothesis
+        else:
+            prev = state.prev_translation
         if not prev:
             return
         if self.target_lang in ["Chinese", "Japanese"]:
@@ -861,6 +872,21 @@ class CascadeSpeechProcessor(SpeechProcessor):
             return self._normalize_translation_text(state.displayed_hypothesis)
         return self._normalize_translation_text(state.prev_translation)
 
+    def _ssbd_prompt_translation_prefix(self, state: CascadeState) -> str:
+        """Prefix embedded in the MT prompt; empty for paper-style full retranslation."""
+        if self._ssbd_raw_emission:
+            return ""
+        return self._committed_translation_prefix(state)
+
+    def _assemble_mt_hypothesis(self, hypothesis: str, prev_prefix: str) -> str:
+        hypothesis = self._normalize_translation_text(hypothesis)
+        if self._ssbd_raw_emission and self._mt_lookahead_mode == MT_LOOKAHEAD_SSBD:
+            return hypothesis
+        prev_prefix = self._normalize_translation_text(prev_prefix)
+        return self._normalize_translation_text(
+            f"{prev_prefix.strip()} {hypothesis}".strip()
+        )
+
     def _compute_retranslation_token_delta(
         self, old_text: str, new_text: str
     ) -> tuple[List[str], List[str]]:
@@ -886,6 +912,8 @@ class CascadeSpeechProcessor(SpeechProcessor):
         return self._ssbd_logit_bias_scale * beta
 
     def _ssbd_draft_suffix(self, state: CascadeState, prev_prefix: str) -> str:
+        if self._ssbd_raw_emission:
+            return self._normalize_translation_text(state.displayed_hypothesis)
         full_prev = self._normalize_translation_text(state.full_mt_hypothesis)
         prev = self._normalize_translation_text(prev_prefix)
         if not full_prev:
@@ -1191,12 +1219,16 @@ class CascadeSpeechProcessor(SpeechProcessor):
         asr_text: str,
         prev_prefix: str,
     ) -> str:
-        prompt, asr_text, prev_prefix = self._fit_llm_prompt(asr_text, prev_prefix)
-        if prev_prefix != state.prev_translation:
-            state.prev_translation = prev_prefix
-            state.translation_hypotheses = [prev_prefix]
+        prompt_prefix = self._ssbd_prompt_translation_prefix(state)
+        prompt, asr_text, fitted_prefix = self._fit_llm_prompt(asr_text, prompt_prefix)
+        if (
+            not self._ssbd_raw_emission
+            and fitted_prefix != state.prev_translation
+        ):
+            state.prev_translation = fitted_prefix
+            state.translation_hypotheses = [fitted_prefix]
 
-        draft_suffix = self._ssbd_draft_suffix(state, prev_prefix)
+        draft_suffix = self._ssbd_draft_suffix(state, fitted_prefix)
         if draft_suffix.strip():
             hypothesis = self._ssbd_generate_from_draft(state, prompt, draft_suffix)
         else:
@@ -1210,8 +1242,8 @@ class CascadeSpeechProcessor(SpeechProcessor):
             ):
                 self._rollback_translation(state, self._fallback_word_rollback)
                 state.consecutive_empty_mt = 0
-                prompt, _, prev_prefix = self._fit_llm_prompt(
-                    asr_text, state.prev_translation
+                prompt, _, _ = self._fit_llm_prompt(
+                    asr_text, self._ssbd_prompt_translation_prefix(state)
                 )
                 hypothesis, _ = self._llm_generate_on_prompt(state, prompt)
             return hypothesis
@@ -1242,20 +1274,25 @@ class CascadeSpeechProcessor(SpeechProcessor):
         full_hypothesis: str,
     ) -> str:
         full_hypothesis = self._normalize_translation_text(full_hypothesis)
-        state.full_mt_hypothesis = full_hypothesis
+        if not full_hypothesis:
+            state.pending_new_tokens = []
+            state.pending_deleted_tokens = []
+            return ""
+
+        old_displayed = self._normalize_translation_text(state.displayed_hypothesis)
         added, deleted = self._compute_retranslation_token_delta(
-            state.displayed_hypothesis,
+            old_displayed,
             full_hypothesis,
         )
+        state.full_mt_hypothesis = full_hypothesis
         state.displayed_hypothesis = full_hypothesis
         state.prev_translation = full_hypothesis
         state.pending_new_tokens = added
         state.pending_deleted_tokens = deleted
         logger.info(
-            "[SSBD raw] deleted=%r added=%r (displayed_len=%d)",
+            "[SSBD raw] deleted=%r added=%r",
             deleted,
             added,
-            len(self._text_to_tokens(full_hypothesis)),
         )
         return ""
 
@@ -1616,21 +1653,21 @@ class CascadeSpeechProcessor(SpeechProcessor):
         prev_prefix: str,
         force_final: bool,
     ) -> str:
+        prompt_prefix = self._ssbd_prompt_translation_prefix(state)
         if self.llm_client is not None and not self._ssbd_batched_verify:
             logger.warning(
                 "[SSBD] Remote OpenAI-compatible backend lacks verified logit_bias "
                 "support; falling back to standard re-translation."
             )
-            hypothesis = self._llm_generate_with_fallback(state, committed_asr, prev_prefix)
+            hypothesis = self._llm_generate_with_fallback(
+                state, committed_asr, prompt_prefix
+            )
         else:
             hypothesis = self._ssbd_generate_with_fallback(
-                state, committed_asr, prev_prefix
+                state, committed_asr, prompt_prefix
             )
 
-        prev_prefix = self._normalize_translation_text(state.prev_translation)
-        full_hypothesis = self._normalize_translation_text(
-            f"{prev_prefix.strip()} {hypothesis}".strip()
-        )
+        full_hypothesis = self._assemble_mt_hypothesis(hypothesis, prev_prefix)
         return self._finalize_ssbd_translation_step(
             state, prev_prefix, full_hypothesis, force_final
         )
@@ -1677,8 +1714,11 @@ class CascadeSpeechProcessor(SpeechProcessor):
         - empty output: after N consecutive empties, roll back committed translation and retry
         - repetition loop: retry with rising temperature until compression ratio drops
         """
+        raw_ssbd = (
+            self._ssbd_raw_emission and self._mt_lookahead_mode == MT_LOOKAHEAD_SSBD
+        )
         prompt, asr_text, prev_prefix = self._fit_llm_prompt(asr_text, prev_prefix)
-        if prev_prefix != state.prev_translation:
+        if not raw_ssbd and prev_prefix != state.prev_translation:
             state.prev_translation = prev_prefix
             state.translation_hypotheses = [prev_prefix]
 
@@ -1694,7 +1734,12 @@ class CascadeSpeechProcessor(SpeechProcessor):
             ):
                 self._rollback_translation(state, self._fallback_word_rollback)
                 state.consecutive_empty_mt = 0
-                prompt, _, prev_prefix = self._fit_llm_prompt(asr_text, state.prev_translation)
+                retry_prefix = (
+                    self._ssbd_prompt_translation_prefix(state)
+                    if raw_ssbd
+                    else state.prev_translation
+                )
+                prompt, _, _ = self._fit_llm_prompt(asr_text, retry_prefix)
                 hypothesis = self._llm_generate(prompt)
                 if not hypothesis.strip():
                     logger.warning(
@@ -1827,9 +1872,15 @@ class CascadeSpeechProcessor(SpeechProcessor):
 
     @torch.inference_mode()
     def process_chunk(self, waveform: np.float32) -> IncrementalOutput:
-        logger.info(f"================ Performing new step ================")
         if waveform is None or len(waveform) == 0:
             return IncrementalOutput([], "", [], "")
+
+        self._chunk_step += 1
+        logger.info(
+            format_step_banner(
+                self._eval_progress, self._state.speech_id, self._chunk_step
+            )
+        )
 
         self._state.total_samples += len(waveform)
         total_duration = self._state.total_samples / SAMPLE_RATE
@@ -1880,6 +1931,8 @@ class CascadeSpeechProcessor(SpeechProcessor):
         )
         current_speech_id = self._state.speech_id + 1
         self._state = self._fresh_state(speech_id=current_speech_id)
+        self._chunk_step = 0
+        self._saw_last_nonempty_chunk = False
         return self._build_incremental_output(translation)
 
     def set_source_language(self, language: str) -> None:
@@ -1899,3 +1952,5 @@ class CascadeSpeechProcessor(SpeechProcessor):
 
     def clear(self) -> None:
         self._state = self._fresh_state(speech_id=self._state.speech_id)
+        self._chunk_step = 0
+        self._saw_last_nonempty_chunk = False

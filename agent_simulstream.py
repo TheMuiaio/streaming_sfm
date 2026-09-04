@@ -29,6 +29,7 @@ from streaming_sfm.hyp_utils import (
 from streaming_sfm.parakeet import _build_slcp_buffer
 from streaming_sfm import LOG_LEVEL
 from streaming_sfm.aligners import AlignmentResult, WordAligner
+from streaming_sfm.eval_progress import build_eval_progress_index, format_step_banner
 from streaming_sfm.streaming_model import (
     StreamingBatchedAudioBufferWithOffset,
     StreamingParakeet,
@@ -645,6 +646,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
         self._needs_resample = self._input_sample_rate != self._asr_sample_rate
 
         speech_chunk_size = getattr(config, "speech_chunk_size", None)
+        self._speech_chunk_size = float(speech_chunk_size) if speech_chunk_size is not None else None
         self._expected_input_chunk_samples = None
         if speech_chunk_size is not None:
             # Expected samples for a "full" SimulStream chunk. The final chunk
@@ -652,6 +654,12 @@ class CascadeSpeechProcessor(SpeechProcessor):
             self._expected_input_chunk_samples = int(round(float(speech_chunk_size) * self._input_sample_rate))
 
         self._saw_last_nonempty_chunk = False
+        self._chunk_step = 0
+        self._eval_progress = None
+        if self._speech_chunk_size is not None:
+            self._eval_progress = build_eval_progress_index(
+                self._speech_chunk_size, config=config
+            )
         logger.info(
             "Audio sample rates: simulstream=%s Hz, asr=%s Hz, resample=%s",
             self._input_sample_rate,
@@ -1636,9 +1644,15 @@ class CascadeSpeechProcessor(SpeechProcessor):
 
     @torch.inference_mode()
     def process_chunk(self, waveform: np.float32) -> IncrementalOutput:
-        logger.info(f"================ Performing new step ================")
         if waveform is None or len(waveform) == 0:
             return IncrementalOutput([], "", [], "")
+
+        self._chunk_step += 1
+        logger.info(
+            format_step_banner(
+                self._eval_progress, self._state.speech_id, self._chunk_step
+            )
+        )
 
         self._state.total_samples += len(waveform)
         total_duration = self._state.total_samples / SAMPLE_RATE
@@ -1684,6 +1698,8 @@ class CascadeSpeechProcessor(SpeechProcessor):
         translation = self._translate_from_asr(self._state, force_final=True)
         current_speech_id = self._state.speech_id + 1
         self._state = self._fresh_state(speech_id=current_speech_id)
+        self._chunk_step = 0
+        self._saw_last_nonempty_chunk = False
         return self._build_incremental_output(translation)
 
     def set_source_language(self, language: str) -> None:
@@ -1700,3 +1716,5 @@ class CascadeSpeechProcessor(SpeechProcessor):
 
     def clear(self) -> None:
         self._state = self._fresh_state(speech_id=self._state.speech_id)
+        self._chunk_step = 0
+        self._saw_last_nonempty_chunk = False

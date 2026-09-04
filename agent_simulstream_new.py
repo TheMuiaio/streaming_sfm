@@ -305,7 +305,8 @@ class CascadeSpeechProcessor(SpeechProcessor):
     - ``taf``: TAF-style source anticipation via extra LLM calls
     - ``ssbd``: self-speculative biased decoding (Zeng et al., 2026)
       Set ``ssbd_raw_emission: true`` to emit full retranslations with deletions
-      (paper-style NE) instead of LCP-stable append-only output.
+      (paper-style NE) instead of LCP-stable append-only output. Combine with
+      ``ssbd_retranslation_window`` to cap how many trailing units may be revised.
     - ``eac``: use ``agent_simulstream.py`` (PAC / provisional ASR context)
     """
 
@@ -523,6 +524,9 @@ class CascadeSpeechProcessor(SpeechProcessor):
         self._ssbd_logit_bias_scale = float(getattr(config, "ssbd_logit_bias_scale", 25.0))
         self._ssbd_batched_verify = bool(getattr(config, "ssbd_batched_verify", False))
         self._ssbd_raw_emission = bool(getattr(config, "ssbd_raw_emission", False))
+        self._ssbd_retranslation_window = max(
+            0, int(getattr(config, "ssbd_retranslation_window", 0))
+        )
 
         self.sampling_params = SamplingParams(
             temperature=self._temperature,
@@ -872,19 +876,76 @@ class CascadeSpeechProcessor(SpeechProcessor):
             return self._normalize_translation_text(state.displayed_hypothesis)
         return self._normalize_translation_text(state.prev_translation)
 
+    def _ssbd_retranslation_window_enabled(self) -> bool:
+        return (
+            self._ssbd_raw_emission
+            and self._mt_lookahead_mode == MT_LOOKAHEAD_SSBD
+            and self._ssbd_retranslation_window > 0
+        )
+
+    def _ssbd_split_displayed_tokens(
+        self, state: CascadeState
+    ) -> tuple[List[str], List[str]]:
+        tokens = self._text_to_tokens(state.displayed_hypothesis)
+        if not self._ssbd_retranslation_window_enabled():
+            return [], tokens
+        stable_n = max(0, len(tokens) - self._ssbd_retranslation_window)
+        return tokens[:stable_n], tokens[stable_n:]
+
+    def _ssbd_stable_prefix_text(self, state: CascadeState) -> str:
+        stable_tokens, _ = self._ssbd_split_displayed_tokens(state)
+        if not stable_tokens:
+            return ""
+        return self._normalize_translation_text(self.tokens_to_string(stable_tokens))
+
+    def _ssbd_unstable_suffix_text(self, state: CascadeState) -> str:
+        _, unstable_tokens = self._ssbd_split_displayed_tokens(state)
+        if not unstable_tokens:
+            return ""
+        return self._normalize_translation_text(self.tokens_to_string(unstable_tokens))
+
     def _ssbd_prompt_translation_prefix(self, state: CascadeState) -> str:
         """Prefix embedded in the MT prompt; empty for paper-style full retranslation."""
-        if self._ssbd_raw_emission:
-            return ""
-        return self._committed_translation_prefix(state)
+        if not self._ssbd_raw_emission:
+            return self._committed_translation_prefix(state)
+        if self._ssbd_retranslation_window_enabled():
+            return self._ssbd_stable_prefix_text(state)
+        return ""
 
-    def _assemble_mt_hypothesis(self, hypothesis: str, prev_prefix: str) -> str:
+    def _assemble_mt_hypothesis(
+        self, state: CascadeState, hypothesis: str, prev_prefix: str
+    ) -> str:
         hypothesis = self._normalize_translation_text(hypothesis)
         if self._ssbd_raw_emission and self._mt_lookahead_mode == MT_LOOKAHEAD_SSBD:
+            if self._ssbd_retranslation_window_enabled():
+                stable = self._ssbd_stable_prefix_text(state)
+                return self._normalize_translation_text(
+                    f"{stable.strip()} {hypothesis}".strip()
+                )
             return hypothesis
         prev_prefix = self._normalize_translation_text(prev_prefix)
         return self._normalize_translation_text(
             f"{prev_prefix.strip()} {hypothesis}".strip()
+        )
+
+    def _clamp_ssbd_raw_hypothesis_to_stable_prefix(
+        self, state: CascadeState, full_hypothesis: str
+    ) -> str:
+        if not self._ssbd_retranslation_window_enabled():
+            return full_hypothesis
+        stable_tokens, _ = self._ssbd_split_displayed_tokens(state)
+        if not stable_tokens:
+            return full_hypothesis
+        full_tokens = self._text_to_tokens(full_hypothesis)
+        if full_tokens[: len(stable_tokens)] == stable_tokens:
+            return full_hypothesis
+        tail = full_tokens[len(stable_tokens) :]
+        logger.warning(
+            "[SSBD raw] Model revised stable prefix; clamping to %d committed unit(s)",
+            len(stable_tokens),
+        )
+        return self._normalize_translation_text(
+            self.tokens_to_string(stable_tokens + tail)
         )
 
     def _compute_retranslation_token_delta(
@@ -913,6 +974,8 @@ class CascadeSpeechProcessor(SpeechProcessor):
 
     def _ssbd_draft_suffix(self, state: CascadeState, prev_prefix: str) -> str:
         if self._ssbd_raw_emission:
+            if self._ssbd_retranslation_window_enabled():
+                return self._ssbd_unstable_suffix_text(state)
             return self._normalize_translation_text(state.displayed_hypothesis)
         full_prev = self._normalize_translation_text(state.full_mt_hypothesis)
         prev = self._normalize_translation_text(prev_prefix)
@@ -1279,6 +1342,9 @@ class CascadeSpeechProcessor(SpeechProcessor):
             state.pending_deleted_tokens = []
             return ""
 
+        full_hypothesis = self._clamp_ssbd_raw_hypothesis_to_stable_prefix(
+            state, full_hypothesis
+        )
         old_displayed = self._normalize_translation_text(state.displayed_hypothesis)
         added, deleted = self._compute_retranslation_token_delta(
             old_displayed,
@@ -1667,7 +1733,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
                 state, committed_asr, prompt_prefix
             )
 
-        full_hypothesis = self._assemble_mt_hypothesis(hypothesis, prev_prefix)
+        full_hypothesis = self._assemble_mt_hypothesis(state, hypothesis, prev_prefix)
         return self._finalize_ssbd_translation_step(
             state, prev_prefix, full_hypothesis, force_final
         )

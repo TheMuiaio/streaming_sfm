@@ -125,6 +125,12 @@ def run_experiment(
     env["SPEECH_CFG"] = str(config_path)
     env["OUTPUT_DIR"] = str(out_dir)
     env["MCIF_SET"] = mcif_set
+    env.setdefault(
+        "MCIF_ROOT",
+        str(Path.home() / ".cache" / "simuleval" / "mcif_iwslt26"),
+    )
+    # Avoid leftover ACL6060_SET from the parent shell confusing progress path resolution.
+    env.pop("ACL6060_SET", None)
 
     if args.score_only:
         cmd = [str(repo_root / "score_mcif_metrics.sh"), *directions]

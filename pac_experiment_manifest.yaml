@@ -200,7 +200,7 @@ experiments:
   - id: ssbd_raw_batched_lacp096
     group: baseline
     label: SSBD raw batched verify (paper emission), LACP 0.96s
-    description: Batched SSBD with full retranslation emission (no LCP stabilization or display mask-k); should yield NE>0 like the original paper.
+    description: Batched SSBD with bounded raw retranslation (12-word window); emits deletions only in the unstable tail.
     base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
     overrides:
       speech_chunk_size: 0.96
@@ -212,6 +212,7 @@ experiments:
       ssbd_bias_beta: 0.0
       ssbd_mask_k: 0
       ssbd_raw_emission: true
+      ssbd_retranslation_window: 12
 
   - id: ssbd_lacp064
     group: chunk_grid

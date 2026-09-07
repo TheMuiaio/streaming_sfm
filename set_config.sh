@@ -14,6 +14,7 @@
 #   BLEU_TOKENIZER SacreBLEU tokenizer for OmniSTEval (default: intl)
 #   HTML_MAX_SEGS  Max segments in phrase HTML report (0 = all)
 #   SKIP_COMET=1   Skip COMET scoring
+#   COMET_MODEL    COMET checkpoint on Hugging Face (default: Unbabel/XCOMET-XL)
 
 _CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="$_CONFIG_DIR"
@@ -21,6 +22,8 @@ REPO_ROOT="$SCRIPT_DIR"
 
 ACL6060_ROOT="${ACL6060_ROOT:-${HOME}/.cache/simuleval/acl_6060}"
 ACL6060_SET="${ACL6060_SET:-eval}"
+export ACL6060_ROOT
+export ACL6060_SET
 if [[ "$ACL6060_SET" != eval && "$ACL6060_SET" != dev ]]; then
   echo "error: ACL6060_SET must be 'eval' or 'dev' (got: $ACL6060_SET)" >&2
   exit 1
@@ -28,7 +31,8 @@ fi
 
 # Default speech processor config (change this line to switch experiments).
 #SPEECH_CFG="${SPEECH_CFG:-${REPO_ROOT}/speech_processor_qwen35_27b_bnb4_spec.yaml}"
-SPEECH_CFG="${SPEECH_CFG:-${REPO_ROOT}/speech_processor_qwen35_9b_bnb4_smallerW.yaml}"
+SPEECH_CFG="${SPEECH_CFG:-${REPO_ROOT}/speech_processor_policies.yaml}"
+#SPEECH_CFG="${SPEECH_CFG:-${REPO_ROOT}/speech_processor_qwen35_9b_bnb4_smallerW.yaml}"
 #SPEECH_CFG="${SPEECH_CFG:-${REPO_ROOT}/speech_processor.yaml}"
 
 speechp_name="$(basename "${SPEECH_CFG}" .yaml)"
@@ -62,6 +66,7 @@ PYTHON="${PYTHON:-python3}"
 BLEU_TOKENIZER="${BLEU_TOKENIZER:-13a}"
 HTML_MAX_SEGS="${HTML_MAX_SEGS:-0}"
 LATENCY_UNIT="${LATENCY_UNIT:-word}"
+COMET_MODEL="${COMET_MODEL:-Unbabel/XCOMET-XL}"
 
 acl6060_refresh_output_paths
 

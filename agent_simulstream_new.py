@@ -21,6 +21,12 @@ from streaming_sfm.hyp_utils import (
     LCPHypothesisBuffer,
     WaitKHypothesisBuffer,
 )
+from streaming_sfm.ssbd_batched_logits_processor import (
+    SSBD_EXTRA_BOOST,
+    SSBD_EXTRA_DRAFT,
+    SSBD_VLLM_LOGITS_PROCESSOR_AVAILABLE,
+    SSBDDraftBiasLogitsProcessor,
+)
 from streaming_sfm.parakeet import _build_slcp_buffer
 from streaming_sfm import LOG_LEVEL
 from streaming_sfm.eval_progress import build_eval_progress_index, format_step_banner
@@ -362,6 +368,12 @@ class CascadeSpeechProcessor(SpeechProcessor):
         llm_dtype = _resolve_llm_dtype(config, llm_model_name, llm_quantization)
         if llm_dtype is not None:
             kwargs["dtype"] = llm_dtype
+        if (
+            getattr(config, "ssbd_batched_verify", False)
+            and SSBD_VLLM_LOGITS_PROCESSOR_AVAILABLE
+            and SSBDDraftBiasLogitsProcessor is not None
+        ):
+            kwargs["logits_processors"] = [SSBDDraftBiasLogitsProcessor]
         return kwargs
 
     @classmethod
@@ -449,10 +461,21 @@ class CascadeSpeechProcessor(SpeechProcessor):
 
                 cls.tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
             cls.llm = None
+            cls._ssbd_batched_bias_available = False
         else:
             cls.llm_client = None
             if not hasattr(cls, "llm") or cls.llm is None:
                 cls.llm = LLM(**cls._build_vllm_llm_kwargs(config, llm_model_name))
+                cls._ssbd_batched_bias_available = bool(
+                    getattr(config, "ssbd_batched_verify", False)
+                    and SSBD_VLLM_LOGITS_PROCESSOR_AVAILABLE
+                    and SSBDDraftBiasLogitsProcessor is not None
+                )
+                if getattr(config, "ssbd_batched_verify", False) and not cls._ssbd_batched_bias_available:
+                    logger.warning(
+                        "[SSBD] Batched biased verify unavailable (need vLLM V1 "
+                        "logits_processors); beta>0 will fall back to tokenwise verify"
+                    )
                 #from transformers import AutoTokenizer
 
                 cls.tokenizer = cls.llm.get_tokenizer()
@@ -523,6 +546,9 @@ class CascadeSpeechProcessor(SpeechProcessor):
         self._ssbd_mask_k = max(0, int(getattr(config, "ssbd_mask_k", 0)))
         self._ssbd_logit_bias_scale = float(getattr(config, "ssbd_logit_bias_scale", 25.0))
         self._ssbd_batched_verify = bool(getattr(config, "ssbd_batched_verify", False))
+        self._ssbd_batched_bias_available = bool(
+            getattr(self.__class__, "_ssbd_batched_bias_available", False)
+        )
         self._ssbd_raw_emission = bool(getattr(config, "ssbd_raw_emission", False))
         self._ssbd_retranslation_window = max(
             0, int(getattr(config, "ssbd_retranslation_window", 0))
@@ -1025,7 +1051,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
             return
         rate = 100.0 * accepted / total
         mode = "batched" if self._ssbd_batched_verify else "tokenwise"
-        beta = 0.0 if self._ssbd_batched_verify else self._ssbd_bias_beta
+        beta = self._ssbd_bias_beta
         logger.info(
             "[SSBD] Draft acceptance %d/%d tokens (%.1f%%, beta=%.2f, %s)",
             accepted,
@@ -1088,6 +1114,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         logit_bias: Optional[dict[int, float]] = None,
+        extra_args: Optional[dict] = None,
     ) -> tuple[str, List[int]]:
         self._record_llm_calls(state, 1)
         prompt_tokens = self._count_prompt_tokens(prompt)
@@ -1116,14 +1143,17 @@ class CascadeSpeechProcessor(SpeechProcessor):
             token_ids = self.tokenizer.encode(text, add_special_tokens=False)
             return text, token_ids
 
-        sampling_params = SamplingParams(
-            temperature=temp,
-            top_p=self._top_p,
-            top_k=self._top_k,
-            max_tokens=max_tokens,
-            repetition_penalty=self._repetition_penalty,
-            logit_bias=logit_bias,
-        )
+        sampling_kwargs = {
+            "temperature": temp,
+            "top_p": self._top_p,
+            "top_k": self._top_k,
+            "max_tokens": max_tokens,
+            "repetition_penalty": self._repetition_penalty,
+            "logit_bias": logit_bias,
+        }
+        if extra_args is not None:
+            sampling_kwargs["extra_args"] = extra_args
+        sampling_params = SamplingParams(**sampling_kwargs)
         llm_outputs = self.llm.generate(
             [prompt],
             sampling_params=sampling_params,
@@ -1165,8 +1195,9 @@ class CascadeSpeechProcessor(SpeechProcessor):
         draft_suffix: str,
     ) -> str:
         """
-        Option A: one greedy generate verifies the draft prefix (beta=0) and
-        continues in the same KV-cached pass instead of per-token prefills.
+        One greedy generate verifies the draft prefix and continues in the same
+        KV-cached pass. With ``ssbd_bias_beta > 0``, a vLLM logits processor
+        boosts the current draft token only while verification has not diverged.
         """
         draft_token_ids = self._ssbd_draft_token_ids(prompt, draft_suffix)
         state.ssbd_draft_total_tokens = len(draft_token_ids)
@@ -1176,11 +1207,13 @@ class CascadeSpeechProcessor(SpeechProcessor):
             text, _ = self._llm_generate_on_prompt(state, prompt)
             return text
 
-        if self._ssbd_bias_beta > 0.0:
-            logger.debug(
-                "[SSBD] batched verify ignores ssbd_bias_beta=%.2f (uses beta=0)",
-                self._ssbd_bias_beta,
-            )
+        logit_boost = self._ssbd_verification_logit_bias()
+        extra_args = None
+        if logit_boost > 0.0:
+            extra_args = {
+                SSBD_EXTRA_DRAFT: draft_token_ids,
+                SSBD_EXTRA_BOOST: logit_boost,
+            }
 
         prompt_tokens = self._count_prompt_tokens(prompt)
         remaining = min(
@@ -1197,6 +1230,7 @@ class CascadeSpeechProcessor(SpeechProcessor):
             prompt,
             temperature=0.0,
             max_tokens=max_tokens,
+            extra_args=extra_args,
         )
         state.ssbd_draft_accepted_tokens = self._ssbd_count_draft_acceptance(
             generated_ids, draft_token_ids
@@ -1273,6 +1307,13 @@ class CascadeSpeechProcessor(SpeechProcessor):
         draft_suffix: str,
     ) -> str:
         if self._ssbd_batched_verify:
+            if (
+                self._ssbd_bias_beta > 0.0
+                and not self._ssbd_batched_bias_available
+            ):
+                return self._ssbd_generate_from_draft_tokenwise(
+                    state, prompt, draft_suffix
+                )
             return self._ssbd_generate_from_draft_batched(state, prompt, draft_suffix)
         return self._ssbd_generate_from_draft_tokenwise(state, prompt, draft_suffix)
 

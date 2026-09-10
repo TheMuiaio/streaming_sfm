@@ -64,7 +64,12 @@ taf_ralcp_withhold: false
 ssbd_bias_beta: 0.2
 ssbd_logit_bias_scale: 25.0
 ssbd_mask_k: 0
-# Option A: single greedy generate verifies draft prefix (beta=0) in one KV pass
+# Option A: single greedy generate verifies draft prefix in one KV pass.
+# ssbd_bias_beta>0 uses a vLLM logits processor for biased batched verify.
 ssbd_batched_verify: false
-# Paper-faithful emission: emit full retranslations with deletions (no LCP / mask-k)
+# Paper-faithful emission: regenerate the full translation each step (no prompt
+# prefix) and emit deletions via SimulEval; no LCP stabilization or mask-k.
 ssbd_raw_emission: false
+# When >0 with ssbd_raw_emission, only this many trailing latency units (words/chars)
+# remain eligible for retranslation; earlier emitted units are locked in the prompt.
+ssbd_retranslation_window: 0

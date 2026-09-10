@@ -1,0 +1,258 @@
+# Provisional ASR Context (PAC) decoding experiments on MCIF (IWSLT26).
+#
+# Run all enabled experiments:
+#   ./run_mcif_pac_experiments.sh
+#   python3 scripts/run_mcif_pac_experiments.py
+#
+# Generate configs without running inference:
+#   ./run_mcif_pac_experiments.sh --generate-only
+#
+# Re-score existing metrics and refresh the aggregate report:
+#   ./run_mcif_pac_experiments.sh --score-only
+
+benchmark: mcif
+mcif_set: test
+output_root: output/mcif_pac_experiments
+directions: [en-de, en-it]
+base_config: speech_processor_qwen35_9b_bnb4_smallerW.yaml
+
+experiments:
+  - id: committed_asr_lacp096
+    group: main
+    label: Committed ASR only, LACP 0.96s
+    description: Primary committed-ASR-only baseline (central comparison).
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: false
+
+  - id: pac_lacp096
+    group: main
+    label: PAC, LACP 0.96s
+    description: Primary PAC condition paired with committed_asr_lacp096 (central comparison).
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: true
+      pac_use_alignment_boundary: true
+      pac_emit_provisional_target: true
+
+  - id: aggressive_asr_lacp096
+    group: baseline
+    label: Aggressive committed ASR, LACP threshold 1.0, 0.96s
+    description: Tests whether PAC beats simply committing ASR earlier, at the central operating point.
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 1.0
+      sfm_speculative: false
+
+  - id: committed_asr_lacp064
+    group: chunk_grid
+    label: Committed ASR only, LACP 0.64s
+    overrides:
+      speech_chunk_size: 0.64
+      sfm_chunk_secs: 0.64
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: false
+
+  - id: pac_lacp064
+    group: chunk_grid
+    label: PAC, LACP 0.64s
+    overrides:
+      speech_chunk_size: 0.64
+      sfm_chunk_secs: 0.64
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: true
+      pac_use_alignment_boundary: true
+      pac_emit_provisional_target: true
+
+  - id: pac_lacp128
+    group: chunk_grid
+    label: PAC, LACP 1.28s
+    overrides:
+      speech_chunk_size: 1.28
+      sfm_chunk_secs: 1.28
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: true
+      pac_use_alignment_boundary: true
+      pac_emit_provisional_target: true
+
+  - id: committed_asr_lacp128
+    group: chunk_grid
+    label: Committed ASR only, LACP 1.28s
+    overrides:
+      speech_chunk_size: 1.28
+      sfm_chunk_secs: 1.28
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: false
+
+  - id: pac_no_boundary096
+    group: ablation
+    label: PAC without alignment boundary control
+    description: Feeds provisional ASR context but does not split stable/provisional target regions.
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: true
+      pac_use_alignment_boundary: false
+      pac_emit_provisional_target: true
+
+  - id: pac_hidden_context096
+    group: ablation
+    label: PAC hidden context only
+    description: Uses provisional ASR as MT context but emits only target text aligned before the provisional source boundary.
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: true
+      pac_use_alignment_boundary: true
+      pac_emit_provisional_target: false
+
+  - id: pac_cap4_096
+    group: ablation
+    label: PAC with 4-word provisional ASR cap
+    description: Tests whether a short provisional ASR suffix captures most of the gain.
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: true
+      sfm_speculative_max_words: 4
+      pac_use_alignment_boundary: true
+      pac_emit_provisional_target: true
+
+  - id: pac_tagged096
+    group: ablation
+    label: Tagged PAC, separated committed/provisional prompt
+    description: Exposes committed vs provisional ASR to the LLM as a tagged prompt; PAC machinery still controls emission, promotion, and retraction.
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: true
+      pac_use_alignment_boundary: true
+      pac_emit_provisional_target: true
+      pac_tagged_prompt: true
+
+  - id: pac_tagged_hidden096
+    group: ablation
+    label: Tagged PAC hidden context only
+    description: Tagged committed/provisional prompt, but emits only target text aligned before the provisional source boundary.
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: true
+      pac_use_alignment_boundary: true
+      pac_emit_provisional_target: false
+      pac_tagged_prompt: true
+
+  - id: pac_noisy_asr096
+    group: ablation
+    label: PAC with degraded ASR audio
+    enabled: false
+    description: Adds reproducible 20 dB audio noise before ASR to test PAC robustness under noisier ASR hypotheses.
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      sfm_speculative: true
+      pac_use_alignment_boundary: true
+      pac_emit_provisional_target: true
+      audio_noise_snr_db: 20.0
+      audio_noise_seed: 13
+
+  - id: offline_upper_bound
+    group: upper_bound
+    label: Offline or full-sentence ASR-to-MT upper bound
+    enabled: false
+    description: Fill this row with an external offline run if available; PAC reports will include it once scores.tsv exists.
+    output_dir: output/mcif_pac_experiments/offline_upper_bound
+
+  - id: ssbd_raw_batched_lacp096
+    group: baseline
+    label: SSBD raw batched verify (paper emission), LACP 0.96s
+    description: Batched SSBD with bounded raw retranslation (12-word window) via agent_simulstream_new.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: ssbd
+      ssbd_batched_verify: true
+      ssbd_bias_beta: 0.0
+      ssbd_mask_k: 0
+      ssbd_raw_emission: true
+      ssbd_retranslation_window: 12
+
+  - id: ssbd_batched_bias_lacp096
+    group: baseline
+    label: SSBD batched biased verify (beta=0.2), LACP 0.96s
+    description: Batched SSBD with paper-style biased draft verification (beta=0.2); LCP emission.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: ssbd
+      ssbd_batched_verify: true
+      ssbd_bias_beta: 0.2
+      ssbd_mask_k: 0
+
+  - id: ssbd_raw_batched_bias_lacp096
+    group: baseline
+    label: SSBD raw batched biased verify (beta=0.2), LACP 0.96s
+    description: Batched biased SSBD with bounded raw retranslation (12-word window).
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: ssbd
+      ssbd_batched_verify: true
+      ssbd_bias_beta: 0.2
+      ssbd_mask_k: 0
+      ssbd_raw_emission: true
+      ssbd_retranslation_window: 12
+
+  - id: taf_fix_lacp096
+    group: baseline
+    label: TAF fix (committed pool + RALCP), LACP 0.96s
+    description: TAF with committed-only MT in the vote pool and RALCP-style withhold on failed vote (no beam search for now).
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: taf
+      taf_num_continuations: 10
+      taf_max_pred_words: 6
+      taf_agree_thres: 0.6
+      taf_min_start_words: 3
+      taf_temperature: 0.7
+      taf_include_committed_hypothesis: true
+      taf_mt_beam_width: 1
+      taf_ralcp_withhold: true
+

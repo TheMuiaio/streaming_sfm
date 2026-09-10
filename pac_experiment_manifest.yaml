@@ -197,6 +197,21 @@ experiments:
       ssbd_bias_beta: 0.0
       ssbd_mask_k: 0
 
+  - id: ssbd_batched_bias_lacp096
+    group: baseline
+    label: SSBD batched biased verify (beta=0.2), LACP 0.96s
+    description: Batched SSBD with paper-style biased draft verification (beta=0.2) via vLLM logits processor; LCP emission.
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: ssbd
+      ssbd_batched_verify: true
+      ssbd_bias_beta: 0.2
+      ssbd_mask_k: 0
+
   - id: ssbd_raw_batched_lacp096
     group: baseline
     label: SSBD raw batched verify (paper emission), LACP 0.96s
@@ -210,6 +225,23 @@ experiments:
       mt_lookahead_mode: ssbd
       ssbd_batched_verify: true
       ssbd_bias_beta: 0.0
+      ssbd_mask_k: 0
+      ssbd_raw_emission: true
+      ssbd_retranslation_window: 12
+
+  - id: ssbd_raw_batched_bias_lacp096
+    group: baseline
+    label: SSBD raw batched biased verify (beta=0.2), LACP 0.96s
+    description: Batched biased SSBD (beta=0.2) with bounded raw retranslation (12-word window).
+    base_config: speech_processor_qwen35_9b_bnb4_baselines.yaml
+    overrides:
+      speech_chunk_size: 0.96
+      sfm_chunk_secs: 0.96
+      sfm_policy: LACP
+      sfm_lacp_threshold: 2.0
+      mt_lookahead_mode: ssbd
+      ssbd_batched_verify: true
+      ssbd_bias_beta: 0.2
       ssbd_mask_k: 0
       ssbd_raw_emission: true
       ssbd_retranslation_window: 12
